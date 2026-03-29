@@ -39,7 +39,53 @@ To comply with standard prop firm rules (e.g., 4:45 PM EST closures):
 * `git` installed.
 
 ### 2. Clone & Install
-```cmd
-git clone [https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git](https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git)
+\`\`\`cmd
+git clone https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git
 cd YOUR_REPOSITORY
 python -m pip install fastapi uvicorn requests httpx[http2] streamlit pandas pyTelegramBotAPI pytz
+\`\`\`
+
+### 3. Configure Secrets
+1. Rename `config.sample.json` to `config.json`.
+2. Insert your TradingView `secret_passphrase`, Telegram tokens, and Ghost Webhook URLs.
+3. *Note: `config.json` is protected by `.gitignore` and will never be uploaded to the cloud.*
+
+### 4. Boot the Node
+Run the provided batch scripts (ideally mapped to Windows Task Scheduler for auto-boot on system restart):
+\`\`\`cmd
+start run_engine.bat
+start run_dashboard.bat
+\`\`\`
+* **FastAPI Engine:** Runs silently on Port `8001`.
+* **Streamlit UI:** Accessible on Port `8501`.
+
+---
+
+## 📡 TradingView Alert Formatting
+
+### Standard Entry/Exit Signal
+Trigger: *Once Per Bar Close*
+\`\`\`json
+{
+  "passphrase": "YOUR_SECRET_PASSPHRASE",
+  "action": "long", 
+  "symbol": "MNQ",
+  "price": {{close}}
+}
+\`\`\`
+*(Valid actions: `long`, `short`, `buy`, `sell`, `exit`, `close`, `flat`)*
+
+### The 1-Minute Heartbeat Ping
+Trigger: *Once Per Bar (on a 1-Minute Chart)*
+\`\`\`json
+{
+  "passphrase": "YOUR_SECRET_PASSPHRASE",
+  "action": "ping",
+  "symbol": "MNQ",
+  "price": {{close}}
+}
+\`\`\`
+*(Ensure "Notify on App" and "Send Email" are unchecked in TradingView to prevent mobile spam).*
+
+---
+*Disclaimer: This software is designed for execution routing and risk management. It is the user's responsibility to ensure compliance with their specific Proprietary Trading Firm's terms of service regarding automated trading and API usage.*
