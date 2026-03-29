@@ -1,0 +1,15 @@
+# Ignore live configurations and secrets
+config.json
+
+# Ignore live databases and write-ahead logs
+trades.db
+trades.db-wal
+trades.db-shm
+
+# Ignore Python cache and local logs
+__pycache__/
+*.pyc
+engine_log.txt
+
+# Ignore daily generated CSV reports
+*.csv

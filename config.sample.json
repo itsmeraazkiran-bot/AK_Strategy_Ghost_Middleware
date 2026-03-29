@@ -1,0 +1,42 @@
+{
+    "credentials": {
+        "secret_passphrase": "REPLACE_WITH_YOUR_PASSPHRASE",
+        "telegram_bot_token": "REPLACE_WITH_YOUR_BOT_TOKEN",
+        "telegram_chat_id": "REPLACE_WITH_YOUR_CHAT_ID"
+    },
+    "ghost_urls": {
+        "MNQ": "https://ghost-url.com/webhook/mnq",
+        "MES": "https://ghost-url.com/webhook/mes",
+        "M2K": "https://ghost-url.com/webhook/m2k",
+        "MYM": "https://ghost-url.com/webhook/mym",
+        "MGC": "https://ghost-url.com/webhook/mgc",
+        "SIL": "https://ghost-url.com/webhook/sil"
+    },
+    "hedge_groups": {
+        "US_EQUITIES": ["MNQ", "MES", "M2K", "MYM"]
+    },
+    "features": {
+        "anti_hedge_protection": true,
+        "heartbeat_monitor": true
+    },
+    "sandbox": {
+        "MNQ": true,
+        "MES": true,
+        "M2K": true,
+        "MYM": true,
+        "MGC": true,
+        "SIL": true
+    },
+    "risk": {
+        "hard_kill": false,
+        "soft_fade": false,
+        "max_daily_loss": -150.0,
+        "daily_profit_target": 500.0,
+        "trailing_activation": 250.0,
+        "trailing_buffer": 100.0
+    },
+    "costs": {
+        "mumbai_slippage_ticks": 2,
+        "commission_round_trip": 1.00
+    }
+}
