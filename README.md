@@ -1,6 +1,6 @@
 # 📈 Robosh V3: Institutional Prop Firm Execution Node
 
-An ultra-low latency, asynchronous Python execution engine designed to bridge TradingView strategies with Prop Firm accounts via Ghost Webhooks. 
+An ultra-low latency, asynchronous Python execution engine designed to bridge TradingView strategies with Prop Firm accounts via Ghost Webhooks (by https://www.quantcrawler.com/). 
 
 Engineered specifically for Windows VPS environments (8GB RAM optimized), this system features a decoupled Streamlit Command Center, an embedded Telegram Bot, and strict institutional risk management protocols to protect funded accounts.
 
