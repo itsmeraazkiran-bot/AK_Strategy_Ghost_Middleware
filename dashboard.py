@@ -40,19 +40,27 @@ def fetch_data():
         c = conn.cursor()
         c.execute("SELECT trade_count, realized_pnl, highest_pnl FROM daily_risk WHERE date=?", (today,))
         metrics = c.fetchone() or (0, 0.0, 0.0)
+        
         c.execute("SELECT value FROM system_status WHERE key='last_ping'")
         lp = c.fetchone()
         last_ping = to_local_time_str(lp[0]) if lp else "Awaiting Signal..."
-    except: metrics, last_ping = (0, 0.0, 0.0), "Database Locked"
-    conn.close(); return pos_df, metrics, last_ping
+        
+        c.execute("SELECT value FROM system_status WHERE key='telegram_status'")
+        ts = c.fetchone()
+        telegram_status = ts[0] if ts else "🔴 OFFLINE"
+    except: metrics, last_ping, telegram_status = (0, 0.0, 0.0), "Database Locked", "🔴 ERROR"
+    conn.close(); return pos_df, metrics, last_ping, telegram_status
 
+# --- UI LAYOUT ---
 st.title("📈 Robosh V5 Command Center")
 config = load_config()
-pos_df, metrics, last_ping = fetch_data()
+pos_df, metrics, last_ping, telegram_status = fetch_data()
 
 total_floating = pos_df['floating_pnl'].sum() if not pos_df.empty and 'floating_pnl' in pos_df else 0.0
 
-st.caption(f"📡 **Last TV Heartbeat:** {last_ping}")
+# Top Status Bar
+st.markdown(f"**📡 Last TV Heartbeat:** `{last_ping}` &nbsp; | &nbsp; **📱 Telegram Bot:** `{telegram_status}`")
+
 col1, col2, col3, col4 = st.columns(4)
 with col1: st.metric("Realized PnL (Net)", f"${metrics[1]:.2f}")
 with col2: st.metric("Floating PnL", f"${total_floating:.2f}", delta_color="normal" if total_floating >= 0 else "inverse")
