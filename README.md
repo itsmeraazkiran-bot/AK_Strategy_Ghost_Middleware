@@ -1,82 +1,71 @@
-# 📈 Robosh V3: Institutional Prop Firm Execution Node
+# 📈 Robosh V5: Institutional Prop Firm Execution Node
 
-An ultra-low latency, asynchronous Python execution engine designed to bridge TradingView strategies with Prop Firm accounts via Ghost Webhooks (by https://www.quantcrawler.com/). 
+An ultra-low latency, asynchronous Python execution engine designed to bridge TradingView strategies with Prop Firm futures accounts via Ghost Webhooks. 
 
-Engineered specifically for Windows VPS environments (8GB RAM optimized), this system features a decoupled Streamlit Command Center, an embedded Telegram Bot, and strict institutional risk management protocols to protect funded accounts.
+Engineered specifically for Windows VPS environments and strict Prop Firm compliance (e.g., Lucid Trading), this system features a decoupled Streamlit Command Center, an embedded Telegram Bot, and advanced institutional risk management protocols.
 
----
+## 🚀 The V5 Architecture Edge
+* **Zero-Latency Async Execution:** Utilizes `httpx` and FastAPI `BackgroundTasks` to process webhooks concurrently, eliminating execution bottlenecks and RAM locking.
+* **Fort Knox Security:** Built-in middleware instantly drops HTTP requests from any IP address not officially registered to TradingView's cloud servers.
+* **RAM-Optimized Database:** Uses SQLite with Write-Ahead Logging (WAL) and automated End-of-Day (EOD) pruning to keep memory footprint under 150MB.
 
-## 🚀 Core Architecture & Features
+## 🛡️ Quantitative Risk & Alpha Filters
+* **Dynamic Volatility Sizing (ATR):** Automatically calculates contract sizing based on a fixed dollar risk and the real-time Average True Range (ATR) passed from TradingView.
+* **Choppy Market Filter (ADX):** Rejects entries when the Average Directional Index (ADX) falls below 20, protecting capital during trendless, mean-reverting regimes.
+* **Intelligent Anti-Hedge Matrix:** Dynamically prevents correlated margin violations across predefined asset classes (e.g., blocking an MES Short if MNQ is Long).
+* **Prop Firm Auto-Flatten:** A scheduled background loop that forcefully flattens all open positions at exactly 4:44 PM EST to guarantee compliance with intraday margin rules.
+* **Ghost 3-Strike Retry Protocol:** Automatically catches dropped packets and 502 Bad Gateway errors, retrying execution to prevent UI/Broker desyncs.
 
-### 1. Zero-Latency Asynchronous Execution
-Built on **FastAPI** and **HTTPX (HTTP/2)**, the engine processes incoming TradingView signals in under 5 milliseconds. Heavy network execution (Ghost routing, Telegram alerts, DB writes) is offloaded to background threads, ensuring the engine never blocks or queues signals during high-volatility events like the Nasdaq open.
-
-### 2. The "Trust but Verify" Protocol
-* **Ghost 3-Strike Retry:** Automatically catches dropped packets (502/504 errors) from the Ghost bridge and retries execution 3 times, 500ms apart.
-* **Desync Dead-Letter:** If Ghost completely fails to respond, the engine refuses to write the trade to the local database, instantly fires a Telegram Desync Alert, and physically locks the symbol's sandbox to prevent ghost positions.
-
-### 3. Advanced Risk Management
-* **Intelligent Anti-Hedge Matrix:** Dynamically prevents correlated margin violations based on configurable `hedge_groups` (e.g., blocking an MES Short if MNQ is Long).
-* **Dual-Switch Shutdown:** * **🛑 Hard Kill:** Panic button that instantly flattens all open positions and locks the system.
-    * **🌙 Soft Fade:** Rejects new entries but allows existing runners to hit their natural exit signals.
-* **Live Configuration:** Adjust Daily Max Loss, Profit Targets, and Trailing Stops via the UI without rebooting the engine.
-
-### 4. Zero-Data-Feed Floating PnL
-Instead of paying for expensive live data feeds, the engine processes silent **1-minute heartbeat pings** directly from TradingView. This updates the local SQLite database with current market prices, allowing the Streamlit UI to calculate live Floating PnL and trigger trailing stops independently of the execution engine.
-
-### 5. Automated EOD Operations
-To comply with standard prop firm rules (e.g., 4:45 PM EST closures):
-* The engine runs a background loop that generates a daily CSV trade report at **4:50 PM EST**.
-* The report is sent via Telegram.
-* The local SQLite database is automatically pruned (logs older than 7 days are deleted) to maintain a footprint of <150MB.
-
----
+## 📊 Supported Instruments
+* **Equities:** MNQ, MES, MYM, M2K
+* **Metals:** MGC, SIL
 
 ## 🛠️ Installation & Setup
 
-### 1. Prerequisites
-* Python 3.12+ installed on Windows Server.
-* `git` installed.
-
-### 2. Clone & Install
+**1. Clone the Repository**
+Open your Windows Server Administrator Command Prompt:
 \`\`\`cmd
-git clone https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git
-cd YOUR_REPOSITORY
-python -m pip install fastapi uvicorn requests httpx[http2] streamlit pandas pyTelegramBotAPI pytz
+git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
+cd YOUR_REPO_NAME
 \`\`\`
 
-### 3. Configure Secrets
-1. Rename `config.sample.json` to `config.json`.
-2. Insert your TradingView `secret_passphrase`, Telegram tokens, and Ghost Webhook URLs.
-3. *Note: `config.json` is protected by `.gitignore` and will never be uploaded to the cloud.*
+**2. Install Dependencies**
+\`\`\`cmd
+python -m pip install fastapi uvicorn requests httpx streamlit pandas pyTelegramBotAPI pytz
+\`\`\`
 
-### 4. Boot the Node
-Run the provided batch scripts (ideally mapped to Windows Task Scheduler for auto-boot on system restart):
+**3. Configure Your Secrets**
+* Rename the template file: `ren config.sample.json config.json`
+* Input your Telegram tokens, Ghost webhook URLs, and TV Passphrase into `config.json`.
+* Adjust your `mumbai_slippage_ticks` and `commission_round_trip` based on your physical latency to the CME.
+
+**4. Boot the Node**
+Run the background execution engine and the Streamlit UI:
 \`\`\`cmd
 start run_engine.bat
 start run_dashboard.bat
 \`\`\`
-* **FastAPI Engine:** Runs silently on Port `8001`.
-* **Streamlit UI:** Accessible on Port `8501`.
+*(Engine runs silently on Port `8001`; UI is accessible on Port `8501`).*
 
----
+## 📡 TradingView Webhook Configuration
 
-## 📡 TradingView Alert Formatting
+To fully utilize the V5 Quantitative Filters, your TradingView alerts must pass the ADX and ATR values in the JSON payload. If they are not included, the engine will safely default to 1 contract and bypass the chop filter.
 
-### Standard Entry/Exit Signal
-Trigger: *Once Per Bar Close*
+**Standard Entry Payload:**
 \`\`\`json
 {
   "passphrase": "YOUR_SECRET_PASSPHRASE",
-  "action": "long", 
+  "action": "long",
   "symbol": "MNQ",
-  "price": {{close}}
+  "price": {{close}},
+  "adx": {{plot("ADX")}},
+  "atr": {{plot("ATR")}}
 }
 \`\`\`
-*(Valid actions: `long`, `short`, `buy`, `sell`, `exit`, `close`, `flat`)*
+*(Note: Ensure `"ADX"` and `"ATR"` match the exact plot names in your Pine Script).*
 
-### The 1-Minute Heartbeat Ping
-Trigger: *Once Per Bar (on a 1-Minute Chart)*
+**The 1-Minute Live PnL Ping:**
+Set this alert to fire "Once Per Bar" on a 1-minute chart (Disable App/Email notifications in TradingView to prevent spam).
 \`\`\`json
 {
   "passphrase": "YOUR_SECRET_PASSPHRASE",
@@ -85,7 +74,11 @@ Trigger: *Once Per Bar (on a 1-Minute Chart)*
   "price": {{close}}
 }
 \`\`\`
-*(Ensure "Notify on App" and "Send Email" are unchecked in TradingView to prevent mobile spam).*
 
----
-*Disclaimer: This software is designed for execution routing and risk management. It is the user's responsibility to ensure compliance with their specific Proprietary Trading Firm's terms of service regarding automated trading and API usage.*
+## 📋 Standard Operating Procedures (SOPs)
+
+**Weekly Reconciliation (Friday @ 5:05 PM EST)**
+To prevent "PnL Drift" caused by latency variations, perform this audit weekly:
+1. Export the weekly trade log from your Prop Firm dashboard.
+2. Compare the Prop Firm Net PnL to the Robosh Shadow PnL (delivered via Telegram EOD reports).
+3. If Robosh is over-reporting profits, increase the `mumbai_slippage_ticks` value in `config.json` before Sunday open.

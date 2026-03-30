@@ -1,4 +1,3 @@
-import sys
 import sqlite3
 import httpx
 import pytz
@@ -18,20 +17,16 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-# --- FIX FOR WINDOWS EMOJI CRASH ---
-sys.stdout.reconfigure(encoding='utf-8')
-sys.stderr.reconfigure(encoding='utf-8')
-
 # --- INSTITUTIONAL ROLLING LOGGER ---
 log_formatter = logging.Formatter('[%(asctime)s EST] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger('robosh_engine')
 logger.setLevel(logging.INFO)
 
-console_handler = logging.StreamHandler(sys.stdout)
+console_handler = logging.StreamHandler()
 console_handler.setFormatter(log_formatter)
 logger.addHandler(console_handler)
 
-# ADDED encoding='utf-8' to prevent the file writer from crashing
+# Using system_log.txt to avoid the Windows File Lock
 file_handler = RotatingFileHandler('system_log.txt', maxBytes=5*1024*1024, backupCount=2, encoding='utf-8')
 file_handler.setFormatter(log_formatter)
 logger.addHandler(file_handler)
@@ -82,7 +77,7 @@ async def async_send_ghost_webhook(url: str, payload: dict):
             await asyncio.sleep(0.5)
         return False
 
-# --- NEWS BLACKOUT CACHE (RESTORED) ---
+# --- NEWS BLACKOUT CACHE ---
 cached_news_blackouts = []
 last_news_fetch = None
 
@@ -93,6 +88,7 @@ async def fetch_news_loop():
             today_str = get_est_time().strftime('%Y-%m-%d')
             if last_news_fetch != today_str:
                 try:
+                    # UPDATED MIRROR URL
                     res = await client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
                     events = res.json()
                     blackouts = []
@@ -105,7 +101,7 @@ async def fetch_news_loop():
                     logger.info(f"📰 News Cached: {len(blackouts)} Red Folder events today.")
                 except Exception as e: 
                     logger.error(f"News Fetch Error: {str(e)}")
-            await asyncio.sleep(3600) # Check every hour
+            await asyncio.sleep(3600)
 
 def is_news_blackout_active(current_est):
     if not load_config().get("features", {}).get("news_blackout", False): return False
@@ -157,7 +153,7 @@ async def market_schedule_loop():
 
 # --- EXECUTION ENGINE ---
 async def execute_trade_logic(signal_dict: dict):
-    symbol, action, price = signal_dict['symbol'], signal_dict['action'].lower(), signal_dict['price']
+    symbol, action, price = signal_dict['symbol'], signal_dict['action'].lower(), signal_dict.get('price')
     adx, atr = signal_dict.get('adx', 25.0), signal_dict.get('atr', 1.0) 
     cfg = load_config()
     est_now = get_est_time()
@@ -186,17 +182,14 @@ async def execute_trade_logic(signal_dict: dict):
     if is_entry:
         if risk.get("soft_fade", False) or not cfg.get("sandbox", {}).get(symbol, True): conn.close(); return 
         
-        # 1. News Blackout Check
         if is_news_blackout_active(est_now):
             send_telegram(f"🚫 <b>NEWS BLACKOUT:</b> Blocked {action.upper()} {symbol}")
             conn.close(); return
             
-        # 2. Chop Filter Check
         if feat.get("choppy_market_filter", False) and adx < 20.0:
             send_telegram(f"🌊 <b>CHOP FILTER BLOCKED:</b> {action.upper()} {symbol} rejected (ADX: {adx:.1f})")
             conn.close(); return
 
-    # 3. Dynamic Sizing Math
     qty = 1
     if is_entry and feat.get("dynamic_sizing", False) and atr > 0:
         risk_usd = risk.get("risk_per_trade_usd", 50.0)
@@ -284,7 +277,7 @@ async def lifespan(app: FastAPI):
     conn.commit(); conn.close()
     
     asyncio.create_task(market_schedule_loop())
-    asyncio.create_task(fetch_news_loop()) # RESTORED
+    asyncio.create_task(fetch_news_loop())
     
     if bot:
         threading.Thread(target=start_telegram_polling, daemon=True).start()
@@ -313,20 +306,37 @@ class TradingSignal(BaseModel):
     adx: float = 25.0
     atr: float = 1.0
 
+# --- THE BULLETPROOF RAW WEBHOOK CATCHER ---
 @app.post("/tv-webhook")
-async def tv_webhook(signal: TradingSignal, background_tasks: BackgroundTasks):
+async def tv_webhook(request: Request, background_tasks: BackgroundTasks):
+    raw_data = await request.body()
+    raw_text = raw_data.decode("utf-8")
+    
+    logger.info(f"📥 RAW TV PAYLOAD CAUGHT: {raw_text}")
+        
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ JSON CONVERSION FAILED! TradingView sent bad formatting. Error: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON format")
+        
+    try:
+        signal = TradingSignal(**payload)
+    except Exception as e:
+        logger.error(f"❌ DATA FORMAT ERROR! Missing required fields. Error: {e}")
+        raise HTTPException(status_code=422, detail="Data mismatch")
+
     if signal.passphrase != SECRET_PASSPHRASE: 
-        logger.warning(f"🔑 AUTH FAILED: Invalid passphrase received. Payload: {signal.dict()}")
+        logger.warning("🔑 AUTH FAILED: Invalid passphrase.")
         raise HTTPException(status_code=401)
     
-    if signal.action.lower() != "ping":
-        logger.info(f"📥 INBOUND FROM TV | Payload: {signal.dict()}")
-        
     signal.symbol = clean_symbol(signal.symbol)
-    if signal.market_position and signal.market_position.lower() == "flat": signal.action = "exit"
+    if signal.market_position and signal.market_position.lower() == "flat": 
+        signal.action = "exit"
+        
     background_tasks.add_task(execute_trade_logic, signal.dict())
-    return {"status": "success"}
+    return {"status": "success", "message": "Payload converted and routed successfully"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=80, access_log=False)
+    uvicorn.run(app, host="0.0.0.0", port=8001, access_log=False)
