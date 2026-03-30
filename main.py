@@ -25,16 +25,29 @@ def load_config():
         with open(CONFIG_FILE, 'r') as f: return json.load(f)
     return {}
 
+# --- OPTIONAL TELEGRAM CONFIGURATION ---
 config = load_config()
 SECRET_PASSPHRASE = config.get("credentials", {}).get("secret_passphrase", "")
 TELEGRAM_BOT_TOKEN = config.get("credentials", {}).get("telegram_bot_token", "")
 TELEGRAM_USER_ID = config.get("credentials", {}).get("telegram_chat_id", "")
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
+
+# Only initialize if the token actually exists and isn't the template placeholder
+if TELEGRAM_BOT_TOKEN and "REPLACE_" not in TELEGRAM_BOT_TOKEN:
+    bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+else:
+    bot = None
 
 def send_telegram(msg):
+    """Sends to Telegram if configured, otherwise falls back to VPS console."""
     if bot:
-        try: bot.send_message(TELEGRAM_USER_ID, msg, parse_mode="HTML")
-        except: pass
+        try: 
+            bot.send_message(TELEGRAM_USER_ID, msg, parse_mode="HTML")
+        except: 
+            pass # Failsafe if Telegram servers drop
+    else:
+        # Strip HTML tags for a clean local console log
+        clean_msg = re.sub(r'<[^<]+>', '', msg)
+        print(f"[{get_est_time().strftime('%H:%M:%S EST')}] LOCAL LOG: {clean_msg}")
 
 def clean_symbol(raw: str):
     match = re.match(r"^([A-Za-z]+)", raw)
@@ -166,14 +179,24 @@ async def execute_trade_logic(signal_dict: dict):
 # --- FASTAPI SETUP & MIDDLEWARE ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 1. Ensure DB integrity on boot
     conn = sqlite3.connect("trades.db", timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("CREATE TABLE IF NOT EXISTS daily_risk (date TEXT PRIMARY KEY, trade_count INTEGER, realized_pnl REAL, highest_pnl REAL)")
     conn.execute("INSERT OR IGNORE INTO daily_risk (date, trade_count, realized_pnl, highest_pnl) VALUES (?, 0, 0.0, 0.0)", (get_est_time().strftime('%Y-%m-%d'),))
     conn.commit(); conn.close()
     
+    # 2. Start background market loops
     asyncio.create_task(market_schedule_loop())
-    send_telegram("🟢 <b>SYSTEM BOOT:</b> Engine & Execution Monitor Online.")
+    
+    # 3. Optional Telegram Polling
+    if bot:
+        # Assuming you have your Telegram command handlers defined above
+        threading.Thread(target=start_telegram_polling, daemon=True).start()
+        send_telegram("🟢 <b>SYSTEM BOOT:</b> Engine, DB, and Telegram Monitor Online.")
+    else:
+        send_telegram("🟢 SYSTEM BOOT: Engine Online. (Telegram Disabled - Logging to Console)")
+        
     yield
 
 app = FastAPI(lifespan=lifespan)
