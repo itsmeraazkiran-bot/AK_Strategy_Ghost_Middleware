@@ -1,6 +1,6 @@
 # 📈 Robosh V3: Institutional Prop Firm Execution Node
 
-An ultra-low latency, asynchronous Python execution engine designed to bridge TradingView strategies with Prop Firm MT5 accounts via Ghost Webhooks. 
+An ultra-low latency, asynchronous Python execution engine designed to bridge TradingView strategies with Prop Firm accounts via Ghost Webhooks (by https://www.quantcrawler.com/). 
 
 Engineered specifically for Windows VPS environments (8GB RAM optimized), this system features a decoupled Streamlit Command Center, an embedded Telegram Bot, and strict institutional risk management protocols to protect funded accounts.
 
@@ -12,7 +12,7 @@ Engineered specifically for Windows VPS environments (8GB RAM optimized), this s
 Built on **FastAPI** and **HTTPX (HTTP/2)**, the engine processes incoming TradingView signals in under 5 milliseconds. Heavy network execution (Ghost routing, Telegram alerts, DB writes) is offloaded to background threads, ensuring the engine never blocks or queues signals during high-volatility events like the Nasdaq open.
 
 ### 2. The "Trust but Verify" Protocol
-* **Ghost 3-Strike Retry:** Automatically catches dropped packets (502/504 errors) from the MT5 Ghost bridge and retries execution 3 times, 500ms apart.
+* **Ghost 3-Strike Retry:** Automatically catches dropped packets (502/504 errors) from the Ghost bridge and retries execution 3 times, 500ms apart.
 * **Desync Dead-Letter:** If Ghost completely fails to respond, the engine refuses to write the trade to the local database, instantly fires a Telegram Desync Alert, and physically locks the symbol's sandbox to prevent ghost positions.
 
 ### 3. Advanced Risk Management
