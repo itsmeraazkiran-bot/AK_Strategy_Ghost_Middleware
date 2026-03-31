@@ -3,6 +3,7 @@
         "secret_passphrase": "REPLACE_WITH_YOUR_PASSPHRASE",
         "telegram_bot_token": "REPLACE_WITH_YOUR_BOT_TOKEN",
         "telegram_chat_id": "REPLACE_WITH_YOUR_CHAT_ID"
+		"ngrok_auth_token": "AUTH_TOKEN"
     },
     "ghost_urls": {
         "MNQ": "https://ghost-url.com/webhook/mnq",
