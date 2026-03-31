@@ -141,6 +141,9 @@ Because your strategy is closed-source, configure your TradingView Strategy Aler
 \`\`\`
 *(Note: Ensure you include the quotation marks `""` around the dynamic string variables).*
 
+<img width="1889" height="857" alt="image" src="https://github.com/user-attachments/assets/4c81b111-a42c-41e1-bb79-f00c9b1a9a59" />
+
+
 ---
 
 ## 🛑 Troubleshooting
