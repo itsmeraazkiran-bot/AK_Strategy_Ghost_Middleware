@@ -5,14 +5,19 @@ import os
 import asyncio
 import threading
 import re
+import time
 from datetime import datetime
 import pytz
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 import telebot
 from pyngrok import ngrok
 
-app = FastAPI()
 EXCHANGE_TZ = pytz.timezone('America/New_York')
+
+# --- GLOBAL CONNECTION POOL ---
+# This keeps a permanent, pre-warmed connection open to Ghost to eliminate TLS handshake latency.
+http_client = None
 
 def get_est_time():
     return datetime.now(pytz.utc).astimezone(EXCHANGE_TZ).strftime('%Y-%m-%d %H:%M:%S')
@@ -31,13 +36,29 @@ TELEGRAM_TOKEN = config.get("credentials", {}).get("telegram_bot_token", "")
 TELEGRAM_CHAT_ID = config.get("credentials", {}).get("telegram_chat_id", "")
 NGROK_AUTH_TOKEN = config.get("credentials", {}).get("ngrok_auth_token", "")
 
-if TELEGRAM_TOKEN and "REPLACE_" not in TELEGRAM_TOKEN: bot = telebot.TeleBot(TELEGRAM_TOKEN)
-else: bot = None
+if TELEGRAM_TOKEN and "REPLACE_" not in TELEGRAM_TOKEN: 
+    bot = telebot.TeleBot(TELEGRAM_TOKEN)
+else: 
+    bot = None
 
-def send_telegram(msg: str):
+# --- BACKGROUND TELEGRAM LOGGING ---
+def send_telegram_bg(msg: str):
+    """Fires in the background so trading execution never waits for Telegram."""
     if bot and TELEGRAM_CHAT_ID:
         try: bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="HTML")
         except: pass
+
+def log_msg(msg: str, to_tg: bool = True):
+    timestamp = get_est_time()
+    conn = sqlite3.connect("trades.db", timeout=10)
+    conn.execute("INSERT INTO logs (timestamp, message) VALUES (?, ?)", (timestamp, msg))
+    conn.commit()
+    conn.close()
+    
+    print(f"[{timestamp}] {msg}")
+    
+    if to_tg: 
+        threading.Thread(target=send_telegram_bg, args=(f"ℹ️ {msg}",), daemon=True).start()
 
 def init_db():
     conn = sqlite3.connect("trades.db", timeout=10)
@@ -48,16 +69,10 @@ def init_db():
     conn.execute("CREATE TABLE IF NOT EXISTS system_state (key TEXT PRIMARY KEY, value TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS webhook_audits (timestamp TEXT, symbol TEXT, action TEXT, tv_inbound TEXT, ghost_outbound TEXT, ghost_response TEXT)")
     conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('status', 'RUNNING')")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
-def log_msg(msg: str, to_tg: bool = True):
-    timestamp = get_est_time()
-    conn = sqlite3.connect("trades.db", timeout=10)
-    conn.execute("INSERT INTO logs (timestamp, message) VALUES (?, ?)", (timestamp, msg))
-    conn.commit(); conn.close()
-    print(f"[{timestamp}] {msg}")
-    if to_tg: send_telegram(f"ℹ️ {msg}")
-
+# --- TELEGRAM LISTENER ---
 if bot:
     @bot.message_handler(commands=['status', 'positions', 'closed'])
     def handle_commands(message):
@@ -78,8 +93,21 @@ if bot:
         conn.close()
 
     def start_telegram_polling():
-        bot.set_my_commands([telebot.types.BotCommand("status", "Check status"), telebot.types.BotCommand("positions", "List open trades"), telebot.types.BotCommand("closed", "Today's trades")])
-        bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        try:
+            bot.set_my_commands([
+                telebot.types.BotCommand("status", "Check status"), 
+                telebot.types.BotCommand("positions", "List open trades"), 
+                telebot.types.BotCommand("closed", "Today's trades")
+            ])
+        except Exception as e:
+            print(f"⚠️ Telegram setup warning: {e}")
+
+        while True:
+            try:
+                bot.infinity_polling(timeout=20, long_polling_timeout=15)
+            except Exception as e:
+                print(f"⚠️ Telegram Connection Dropped: {e}. Reconnecting in 10s...")
+                time.sleep(10)
 
 async def market_close_report_loop():
     reported_today = False
@@ -91,31 +119,35 @@ async def market_close_report_loop():
             conn = sqlite3.connect("trades.db", timeout=10)
             rows = conn.execute("SELECT symbol, direction, close_price FROM closed_trades WHERE timestamp LIKE ?", (f"{today}%",)).fetchall()
             conn.close()
-            send_telegram(f"📊 <b>EOD Market Report ({today}):</b>\n" + "\n".join([f"• {r[0]}: {r[1].upper()} @ {r[2]}" for r in rows]) if rows else f"📊 <b>EOD Market Report ({today}):</b>\nNo trades executed today.")
+            send_telegram_bg(f"📊 <b>EOD Market Report ({today}):</b>\n" + "\n".join([f"• {r[0]}: {r[1].upper()} @ {r[2]}" for r in rows]) if rows else f"📊 <b>EOD Market Report ({today}):</b>\nNo trades executed today.")
             reported_today = True
         await asyncio.sleep(60)
 
-async def send_to_ghost(symbol: str, action: str, price: float):
+async def send_to_ghost(symbol: str, action: str, price: float, qty: float):
+    global http_client
     url = config.get("ghost_urls", {}).get(symbol)
-    payload = {"action": action, "symbol": symbol, "price": price, "qty": 1}
+    payload = {"action": action, "symbol": symbol, "price": price, "qty": qty}
+    
     if not url: return payload, "⚠️ NO GHOST URL CONFIGURED"
-    async with httpx.AsyncClient() as client:
-        try:
-            res = await client.post(url, json=payload, timeout=5.0)
-            return payload, f"Status: {res.status_code} | Response: {res.text}"
-        except Exception as e: return payload, f"❌ ERROR: {str(e)}"
+    
+    try:
+        # Uses the pre-warmed connection pool instead of opening a new one
+        res = await http_client.post(url, json=payload, timeout=8.0)
+        return payload, f"Status: {res.status_code} | Response: {res.text}"
+    except Exception as e: 
+        return payload, f"❌ ERROR: {str(e)}"
 
 async def process_signal(tv_payload: dict):
     try:
-        # 1. Aggressive Data Sanitization 
         raw_action = str(tv_payload.get("action") or "").lower()
         raw_symbol = str(tv_payload.get("symbol") or "")
         market_pos = str(tv_payload.get("market_position") or "").lower()
         
-        try:
-            price = float(tv_payload.get("price") or 0.0)
-        except (ValueError, TypeError):
-            price = 0.0
+        try: price = float(tv_payload.get("price") or 0.0)
+        except (ValueError, TypeError): price = 0.0
+
+        try: qty = float(tv_payload.get("qty") or 1.0)
+        except (ValueError, TypeError): qty = 1.0
 
         symbol = clean_symbol(raw_symbol)
         action = 'exit' if raw_action in ['close', 'flat'] else raw_action
@@ -144,40 +176,39 @@ async def process_signal(tv_payload: dict):
                 log_msg(f"🛡️ ANTI-HEDGE LOCK: Ignored {action.upper()} {symbol}. Direction locked to {open_dirs[0].upper()}.")
                 conn.close(); return
 
-        # 2. EXECUTE & CAPTURE AUDIT
-        ghost_payload, ghost_response = await send_to_ghost(symbol, action, price)
+        ghost_payload, ghost_response = await send_to_ghost(symbol, action, price, qty)
         
-        # 3. Write Audit to DB 
         safe_tv_payload = {k: v for k, v in tv_payload.items() if k != 'passphrase'}
         c.execute("INSERT INTO webhook_audits (timestamp, symbol, action, tv_inbound, ghost_outbound, ghost_response) VALUES (?, ?, ?, ?, ?, ?)",
                   (get_est_time(), symbol, action.upper(), json.dumps(safe_tv_payload), json.dumps(ghost_payload), ghost_response))
 
-        # 4. Update Positions Display
         msg_to_log = None
         if is_entry:
             c.execute("INSERT OR REPLACE INTO positions (symbol, direction, entry_price) VALUES (?, ?, ?)", (symbol, action, price))
-            msg_to_log = f"🟢 OPENED: {action.upper()} {symbol} @ {price}"
+            msg_to_log = f"🟢 OPENED: {action.upper()} {qty}x {symbol} @ {price}"
         elif action == 'exit' and pos:
             c.execute("INSERT INTO closed_trades (timestamp, symbol, direction, close_price) VALUES (?, ?, ?, ?)", (get_est_time(), symbol, pos[0], price))
             c.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
             msg_to_log = f"🏁 CLOSED: {symbol} @ {price}"
 
-        # CRITICAL FIX: Commit and release the write lock BEFORE calling log_msg
         conn.commit()
         conn.close()
 
-        # 5. Now that the DB is free, safely trigger the log and Telegram push
         if msg_to_log:
             log_msg(msg_to_log)
 
     except Exception as e:
         log_msg(f"❌ ENGINE CRASH: {str(e)}")
 
-@app.on_event("startup")
-async def startup_event():
+# --- FASTAPI LIFESPAN ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    # Boot the persistent HTTP client pool
+    http_client = httpx.AsyncClient()
+    
     init_db()
     
-    # --- Auto-Tunneling Logic ---
     if NGROK_AUTH_TOKEN:
         try:
             ngrok.set_auth_token(NGROK_AUTH_TOKEN)
@@ -192,10 +223,22 @@ async def startup_event():
     open_positions = conn.execute("SELECT symbol, direction, entry_price FROM positions").fetchall()
     conn.close()
     
-    if open_positions: log_msg(f"🔄 <b>ENGINE RESTARTED:</b> Recovered {len(open_positions)} positions.")
+    if open_positions: 
+        log_msg(f"🔄 <b>ENGINE RESTARTED:</b> Recovered {len(open_positions)} positions.")
         
-    if bot: threading.Thread(target=start_telegram_polling, daemon=True).start()
-    asyncio.create_task(market_close_report_loop())
+    if bot: 
+        threading.Thread(target=start_telegram_polling, daemon=True).start()
+    
+    eod_task = asyncio.create_task(market_close_report_loop())
+    
+    yield
+    
+    # Clean shutdown
+    eod_task.cancel()
+    await http_client.aclose()
+    ngrok.kill()
+
+app = FastAPI(lifespan=lifespan)
 
 @app.post("/tv-webhook")
 async def tv_webhook(request: Request, background_tasks: BackgroundTasks):

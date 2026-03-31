@@ -18,7 +18,7 @@ except: status = "LOADING..."
 col1, col2, col3 = st.columns(3)
 with col1:
     if status == 'RUNNING':
-        if st.button("🛑 KILL ENGINE", type="primary", use_container_width=True):
+        if st.button("🛑 KILL ENGINE", type="primary", width="stretch"):
             conn.execute("UPDATE system_state SET value='KILLED' WHERE key='status'")
             conn.execute("INSERT INTO logs (timestamp, message) VALUES (datetime('now', 'localtime'), '🛑 SYSTEM MANUALLY KILLED')")
             conn.commit(); st.rerun()
@@ -26,18 +26,18 @@ with col1:
 
 with col2:
     if status == 'KILLED':
-        if st.button("▶️ RESUME ENGINE", type="secondary", use_container_width=True):
+        if st.button("▶️ RESUME ENGINE", type="secondary", width="stretch"):
             conn.execute("UPDATE system_state SET value='RUNNING' WHERE key='status'")
             conn.execute("INSERT INTO logs (timestamp, message) VALUES (datetime('now', 'localtime'), '▶️ SYSTEM RESUMED')")
             conn.commit(); st.rerun()
     else: st.success("🟢 ENGINE IS RUNNING")
 
 with col3:
-    if st.button("🗑️ CLEAR DATABASE", use_container_width=True):
+    if st.button("🗑️ CLEAR DATABASE", width="stretch"):
         conn.execute("DELETE FROM logs")
         conn.execute("DELETE FROM positions")
         conn.execute("DELETE FROM closed_trades")
-        conn.execute("DELETE FROM webhook_audits") # Wipes audit trail too
+        conn.execute("DELETE FROM webhook_audits") 
         conn.execute("INSERT INTO logs (timestamp, message) VALUES (datetime('now', 'localtime'), '🧹 DATABASE WIPED BY USER')")
         conn.commit(); st.rerun()
 
@@ -51,7 +51,7 @@ with col_log:
     if st.button("🔄 Refresh"): st.rerun()
     try:
         logs_df = pd.read_sql_query("SELECT timestamp, message FROM logs ORDER BY timestamp DESC LIMIT 30", conn)
-        if not logs_df.empty: st.dataframe(logs_df, use_container_width=True, hide_index=True, height=350)
+        if not logs_df.empty: st.dataframe(logs_df, width="stretch", hide_index=True, height=350)
         else: st.info("No logs yet. Awaiting signals...")
     except: st.warning("Database initializing...")
 
@@ -59,14 +59,14 @@ with col_pos:
     st.subheader("🎯 Open Positions")
     try:
         open_df = pd.read_sql_query("SELECT symbol, direction, entry_price FROM positions", conn)
-        if not open_df.empty: st.dataframe(open_df, use_container_width=True, hide_index=True)
+        if not open_df.empty: st.dataframe(open_df, width="stretch", hide_index=True)
         else: st.info("No active positions.")
     except: pass
 
     st.subheader("🏁 Closed Trades History")
     try:
         closed_df = pd.read_sql_query("SELECT timestamp, symbol, direction, close_price FROM closed_trades ORDER BY timestamp DESC LIMIT 15", conn)
-        if not closed_df.empty: st.dataframe(closed_df, use_container_width=True, hide_index=True)
+        if not closed_df.empty: st.dataframe(closed_df, width="stretch", hide_index=True)
         else: st.info("No closed trades yet.")
     except: pass
 
@@ -80,7 +80,6 @@ try:
         st.info("No webhooks processed yet.")
     else:
         for index, row in audits_df.iterrows():
-            # Create a clickable expanding row for each execution
             with st.expander(f"⏱️ {row['timestamp']} | 🎯 {row['symbol']} | ⚡ {row['action']}"):
                 colA, colB, colC = st.columns(3)
                 
