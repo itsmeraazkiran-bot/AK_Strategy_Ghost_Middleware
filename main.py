@@ -6,6 +6,7 @@ import asyncio
 import threading
 import re
 import time
+import sys # <-- Added
 from datetime import datetime, timedelta
 import pytz
 from contextlib import asynccontextmanager
@@ -13,10 +14,11 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 import telebot
 from pyngrok import ngrok
 
-# --- HYPER-OPTIMIZATION: Pre-compile Regex in RAM ---
-SYMBOL_REGEX = re.compile(r"^([A-Za-z]+)")
+# --- FIX FOR WINDOWS ASYNCIO WINERROR 10054 SPAM ---
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# --- GLOBAL CONNECTION POOL ---
+SYMBOL_REGEX = re.compile(r"^([A-Za-z]+)")
 http_client = None
 
 def get_vps_time():
@@ -56,7 +58,6 @@ def log_msg(msg: str, to_tg: bool = True):
 def init_db():
     conn = sqlite3.connect("trades.db", timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
-    # PRAGMA synchronous=NORMAL heavily optimizes disk write speed while maintaining WAL safety
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("CREATE TABLE IF NOT EXISTS logs (timestamp TEXT, message TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS positions (symbol TEXT PRIMARY KEY, direction TEXT, entry_price REAL)")
@@ -69,36 +70,39 @@ def init_db():
 
 async def fetch_daily_data():
     try:
-        now_utc = datetime.now(pytz.utc)
-        vps_tz = datetime.now().astimezone().tzinfo
         sessions = {
-            "Tokyo Open": now_utc.replace(hour=0, minute=0, second=0).astimezone(vps_tz).strftime('%I:%M %p'),
-            "London Open": now_utc.replace(hour=8, minute=0, second=0).astimezone(vps_tz).strftime('%I:%M %p'),
-            "New York Open": now_utc.replace(hour=13, minute=0, second=0).astimezone(vps_tz).strftime('%I:%M %p'),
-            "NYSE Equities": now_utc.replace(hour=14, minute=30, second=0).astimezone(vps_tz).strftime('%I:%M %p'),
-            "New York Close": now_utc.replace(hour=22, minute=0, second=0).astimezone(vps_tz).strftime('%I:%M %p')
+            "Sydney": {"open": 22, "close": 7},
+            "Tokyo": {"open": 23, "close": 8},
+            "London": {"open": 8, "close": 16},
+            "New York": {"open": 13, "close": 22}
         }
+        
         events = []
         async with httpx.AsyncClient() as client:
             res = await client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10.0)
             if res.status_code == 200:
                 data = res.json()
-                today_date = datetime.now().date()
-                tomorrow_date = today_date + timedelta(days=1)
+                vps_tz = datetime.now().astimezone().tzinfo
+                
                 for item in data:
-                    if item.get("impact") in ["High", "Medium"]:
+                    impact = str(item.get("impact", "")).title()
+                    if impact in ["High", "Medium"]:
                         try:
-                            event_utc = datetime.strptime(item["date"], "%Y-%m-%dT%H:%M:%S%z")
+                            event_utc = datetime.fromisoformat(item["date"])
+                            if event_utc.tzinfo is None:
+                                event_utc = event_utc.replace(tzinfo=pytz.utc)
+                            
                             event_local = event_utc.astimezone(vps_tz)
-                            if event_local.date() == today_date or event_local.date() == tomorrow_date:
-                                events.append({
-                                    "title": item["title"],
-                                    "currency": item["country"],
-                                    "impact": item["impact"],
-                                    "day": "Today" if event_local.date() == today_date else "Tomorrow",
-                                    "time": event_local.strftime('%I:%M %p')
-                                })
+                            events.append({
+                                "title": item.get("title", ""),
+                                "currency": item.get("country", ""),
+                                "impact": impact,
+                                "timestamp_iso": event_local.isoformat(),
+                                "forecast": item.get("forecast", ""),
+                                "previous": item.get("previous", "")
+                            })
                         except: pass
+
         conn = sqlite3.connect("trades.db", timeout=10)
         conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('market_sessions', ?)", (json.dumps(sessions),))
         conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('calendar_events', ?)", (json.dumps(events),))
@@ -165,10 +169,8 @@ async def send_to_ghost(symbol: str, action: str, price: float, qty: float):
         return payload, f"Status: {res.status_code} | Response: {res.text}"
     except Exception as e: return payload, f"❌ ERROR: {str(e)}"
 
-# --- THE HEART: LIGHT-SPEED EXECUTION PIPELINE ---
 async def process_signal(tv_payload: dict):
     try:
-        # 1. RAM Calculation Phase (Nanoseconds)
         pending_logs = []
         raw_action = str(tv_payload.get("action") or "").lower()
         raw_symbol = str(tv_payload.get("symbol") or "")
@@ -182,11 +184,11 @@ async def process_signal(tv_payload: dict):
         symbol = clean_symbol(raw_symbol)
         action = 'exit' if raw_action in ['close', 'flat'] else raw_action
         
+        # 1. Primary Flat Check
         if market_pos == 'flat' and action != 'exit':
             pending_logs.append(f"🔄 TV SYNC: Strategy flat. Overriding {raw_action.upper()} to EXIT on {symbol}.")
             action = 'exit'
 
-        # 2. Ultra-Fast SQLite Read Phase (Microseconds)
         conn = sqlite3.connect("trades.db", timeout=10)
         c = conn.cursor()
 
@@ -196,23 +198,45 @@ async def process_signal(tv_payload: dict):
             for log in pending_logs: log_msg(log)
             return
 
+        # 2. Symbol-Specific Reversal Check
         pos = c.execute("SELECT direction FROM positions WHERE symbol=?", (symbol,)).fetchone()
         if pos and action != 'exit':
             if (pos[0] in ['long', 'buy'] and action in ['short', 'sell']) or (pos[0] in ['short', 'sell'] and action in ['long', 'buy']):
                 pending_logs.append(f"🔄 INTELLIGENT REVERSAL: Converted {raw_action.upper()} to EXIT for open {pos[0].upper()} on {symbol}.")
                 action = 'exit'
 
-        # 3. 🚀 THE EXECUTION PHASE 🚀
-        # Sent instantly via pre-warmed connection pool BEFORE any disk writes occur.
+        is_entry = action in ['long', 'short', 'buy', 'sell']
+        
+        # 3. 🛡️ PROP FIRM CORRELATION ANTI-HEDGE LOCK
+        # Prevents illegal hedging across highly correlated assets (e.g., Long MNQ vs Short MES)
+        if is_entry:
+            target_dir = 'long' if action in ['long', 'buy'] else 'short'
+            
+            EQUITIES = {'MNQ', 'MES', 'MYM', 'M2K', 'NQ', 'ES', 'YM', 'RTY'}
+            METALS = {'MGC', 'GC', 'SIL', 'SI'}
+            
+            my_group = None
+            if symbol in EQUITIES: my_group = EQUITIES
+            elif symbol in METALS: my_group = METALS
+            
+            if my_group:
+                open_positions = c.execute("SELECT symbol, direction FROM positions").fetchall()
+                for open_sym, open_dir in open_positions:
+                    if open_sym != symbol and open_sym in my_group:
+                        norm_open_dir = 'long' if open_dir in ['long', 'buy'] else 'short'
+                        if target_dir != norm_open_dir:
+                            pending_logs.append(f"🛡️ CORRELATION LOCK: Ignored {action.upper()} {symbol}. Correlated asset ({open_sym}) is currently {norm_open_dir.upper()}.")
+                            conn.close()
+                            for log in pending_logs: log_msg(log)
+                            return
+
+        # 4. Light-Speed Execution
         ghost_payload, ghost_response = await send_to_ghost(symbol, action, price, qty)
         
-        # 4. The Post-Trade Data Storage Phase (Milliseconds - Deferred to not slow down execution)
         safe_tv_payload = {k: v for k, v in tv_payload.items() if k != 'passphrase'}
         c.execute("INSERT INTO webhook_audits (timestamp, symbol, action, tv_inbound, ghost_outbound, ghost_response) VALUES (?, ?, ?, ?, ?, ?)",
                   (get_vps_time(), symbol, action.upper(), json.dumps(safe_tv_payload), json.dumps(ghost_payload), ghost_response))
 
-        is_entry = action in ['long', 'short', 'buy', 'sell']
-        
         if is_entry:
             c.execute("INSERT OR REPLACE INTO positions (symbol, direction, entry_price) VALUES (?, ?, ?)", (symbol, action, price))
             pending_logs.append(f"🟢 OPENED: {action.upper()} {qty}x {symbol} @ {price}")
@@ -223,17 +247,12 @@ async def process_signal(tv_payload: dict):
 
         conn.commit()
         conn.close()
-
-        # 5. Flush all logs & Telegram messages simultaneously at the very end
-        for log in pending_logs:
-            log_msg(log)
-
+        for log in pending_logs: log_msg(log)
     except Exception as e: log_msg(f"❌ ENGINE CRASH: {str(e)}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
-    # Limits max connections to prevent RAM bloat while keeping them ultra-fast
     http_client = httpx.AsyncClient(limits=httpx.Limits(max_keepalive_connections=5, max_connections=10))
     init_db()
     
@@ -271,15 +290,12 @@ async def tv_webhook(request: Request, background_tasks: BackgroundTasks):
         log_msg("🔑 Auth Failed: Bad Passphrase")
         raise HTTPException(status_code=401)
 
-    # We NO LONGER log "Received Signal" here. We do it instantly in RAM to prevent blocking execution.
     print(f"[{get_vps_time()}] 📥 Received Signal: {payload.get('action', '')} {payload.get('symbol', '')}")
     if bot and TELEGRAM_CHAT_ID: threading.Thread(target=send_telegram_bg, args=(f"ℹ️ 📥 Received Signal: {payload.get('action', '')} {payload.get('symbol', '')}",), daemon=True).start()
     
-    # Offload the entire heavy lifting process instantly to the background thread
     background_tasks.add_task(process_signal, payload)
     return {"status": "success"}
 
 if __name__ == "__main__":
     import uvicorn
-    # log_level="error" mutes the scanner bot warnings so your terminal stays clean
     uvicorn.run(app, host="0.0.0.0", port=8001, access_log=False, log_level="error")
