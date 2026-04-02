@@ -1,106 +1,109 @@
-# ⚡ Robosh V6 Command Center
+# ⚡ Robosh V6.3 Command Center
 
-Robosh V6 is a hyper-optimized, asynchronous Python trading engine and monitoring dashboard designed for zero-latency execution of TradingView webhooks to prop-firm middleware (Ghost/Lucid). 
+Robosh V6.3 is a high-frequency, zero-latency Python trading engine engineered specifically to act as an asynchronous bridge between TradingView webhooks and prop-firm middleware (Ghost/Lucid). 
 
-Engineered specifically for Windows Server VPS environments, it features intelligent state management, native prop-firm correlation hedging protection, and an interactive command center.
+Designed for rigorous prop-firm environments, it features native anti-hedging correlation locks, deep slippage analytics, and an interactive command center that physically separates UI rendering from trade execution to guarantee maximum speed.
 
-## 🚀 Core Features
+## 🚀 Core Architecture & Features
 
-* **Light-Speed Execution Pipeline:** Utilizes global HTTP connection pooling (`httpx`) and deferred SQLite disk-writes to achieve sub-millisecond internal processing. Trades are routed to the broker *before* logs are written to the disk.
-* **Prop-Firm Correlation Engine:** Built-in protection against illegal cross-asset hedging. Automatically groups equities (MNQ, MES, MYM, M2K) and metals (MGC, SIL) to prevent margin-violation account blowouts.
-* **Intelligent Reversal Handling:** Automatically intercepts 'flip' signals (e.g., Long to Short) and converts them to precise `EXIT` orders if a position is already open, maintaining strict directional discipline.
-* **Zero-Blocking Telegram Integration:** Telegram notifications and command polling (`/status`, `/positions`, `/closed`) run on dedicated background threads, ensuring network drops or API delays never slow down trade execution.
-* **Autonomous Recovery:** Uses a WAL-mode SQLite database to remember open positions. If the VPS force-reboots, the engine instantly recovers its state and automatically re-establishes the Ngrok webhook tunnel.
-* **Institutional Dashboard:** A decoupled Streamlit UI featuring:
-  * A live Plotly-rendered 24-hour global session timeline mapped to local VPS time.
-  * A real-time, self-cleaning Forex Factory High-Impact News terminal.
-  * A 1-click Manual Database Sync tool to clear broker-side manual interventions.
+* **Zero-Latency Priority Execution:** The engine guarantees that incoming TradingView webhooks are processed, logic-checked, and fired to the broker *before* any local JSON parsing, SQLite database logging, or Telegram messaging occurs.
+* **Thread-Isolated Health Heartbeat:** The system continually monitors its own uptime. To ensure 0ms of event-loop blocking, the database heartbeat is isolated on a background OS thread, meaning an incoming webhook will never wait for a local database write.
+* **3-Way Tactical Execution Mode:**
+    * **🟢 SAFE Mode:** Enforces strict directional discipline. Auto-flattens flips before reversing. Blocks illegal correlated margin-hedging (e.g., Long NQ + Short ES) to prevent account blowouts.
+    * **⚡ BYPASS Mode:** Acts as a raw, unfiltered API bridge. Passes the order ID directly to Ghost. Disables all local safety checks and position tracking for manual override scenarios.
+    * **🔴 STOPPED Mode:** Absolute kill switch. Webhooks are acknowledged (Status 200) so TradingView doesn't disable your alert, but the trade is ignored.
+* **Ghost Post-Trade JSON Intelligence:** Asynchronously reads the Ghost broker response post-execution to extract:
+    * Exact Realized PNL & Win/Loss Boolean.
+    * TradingView Signal Price vs. Actual Broker Fill Price.
+    * Exact execution slippage (in ticks/points).
+    * True Quantity Fills (handling partials).
+* **Hierarchical PNL Tracker:** The dashboard dynamically extracts all historical trading dates. Users can select any date to view a nested, interactive breakdown of their trades: **Grand Total ➡️ Global Session (Asian/London/NY) ➡️ Specific Symbol ➡️ Individual Trades.**
+* **Slippage Analytics Wizard:** A live UI module that dynamically compares average slippage across assets, segmented by Safe vs. Bypass mode to identify latency costs and broker manipulation over time.
 
 ## 🛠️ Tech Stack
 
-* **Core Engine:** Python 3.12+, FastAPI, Uvicorn, Asyncio
-* **Dashboard:** Streamlit, Pandas, Plotly
-* **Database:** SQLite3 (WAL Mode, `synchronous=NORMAL`)
-* **Networking:** PyNgrok, HTTPX (Connection Pooling)
-* **Notifications:** Telebot (PyTelegramBotAPI)
-
-## ⚙️ Prerequisites & Installation
-
-1. Clone or download the repository to your VPS (e.g., `C:\TradingBot`).
-2. Install Python 3.12+ and create a virtual environment:
-   ```cmd
-   python -m venv venv
-   call venv\Scripts\activate
-   pip install fastapi uvicorn httpx pyngrok telebot streamlit pandas plotly pytz
-   ```
-3. Create a `config.json` file in the root directory with the following structure:
-   ```json
-   {
-     "credentials": {
-       "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
-       "telegram_chat_id": "YOUR_CHAT_ID",
-       "ngrok_auth_token": "YOUR_NGROK_TOKEN",
-       "secret_passphrase": "YourWebhookPassword123"
-     },
-     "ghost_urls": {
-       "MNQ": "[https://api.ghost.com/webhook/mnq_endpoint](https://api.ghost.com/webhook/mnq_endpoint)",
-       "MYM": "[https://api.ghost.com/webhook/mym_endpoint](https://api.ghost.com/webhook/mym_endpoint)",
-       "MGC": "[https://api.ghost.com/webhook/mgc_endpoint](https://api.ghost.com/webhook/mgc_endpoint)"
-     }
-   }
-   ```
-
-## 🖥️ Running the System
-
-The system is split into two completely decoupled processes to guarantee UI rendering never impacts trade execution.
-
-### 1. The Execution Engine (`main.py`)
-Runs the FastAPI webhook listener on Port 8001 and handles all trade logic.
-```cmd
-call venv\Scripts\activate
-python main.py
-```
-*Note: Uvicorn logging is suppressed to `error` level to hide harmless public internet port-scanning noise.*
-
-### 2. The Command Center (`dashboard.py`)
-Runs the Streamlit interactive monitoring dashboard on Port 8501.
-```cmd
-call venv\Scripts\activate
-streamlit run dashboard.py --server.port 8501 --logger.level=error
-```
-
-## 🛡️ 24/7 VPS Deployment (Windows Server)
-
-To ensure the bot survives Windows Server updates and automatic reboots:
-1. Create shortcut `.lnk` files for your `run_engine.bat` and `run_dashboard.bat` scripts.
-2. Press `Win + R`, type `shell:startup`, and hit Enter.
-3. Drag and drop the shortcuts into the Startup folder.
-4. **Important:** When leaving the VPS, click the **"X"** on the Remote Desktop window to disconnect. **Do not** click "Sign Out" or "Log Off" inside Windows, as this will terminate the background processes.
-
-## 📊 TradingView Webhook Format
-
-Configure your TradingView alerts to send the following JSON payload to your generated Ngrok URL (e.g., `https://<your-ngrok-url>.ngrok-free.app/tv-webhook`):
-
-```json
-{
-  "passphrase": "YourWebhookPassword123",
-  "action": "{{strategy.order.action}}",
-  "market_position": "{{strategy.market_position}}",
-  "symbol": "{{ticker}}",
-  "price": {{close}},
-  "qty": 1
-}
-```
-<img width="1889" height="857" alt="image" src="https://github.com/user-attachments/assets/4c81b111-a42c-41e1-bb79-f00c9b1a9a59" />
-
-## ⚠️ Important Notes on Latency
-Robosh V6 processes internal logic in **< 5 milliseconds**. Any execution delays observed in the logs (typically 1.5s to 3.0s) represent the unavoidable physical round-trip time of the internet: `VPS -> Ghost Middleware -> Prop Firm Risk API -> CME Match Engine -> VPS`. Ensure your VPS is geographically located as close to the Chicago CME servers (Aurora, IL) as possible for optimal routing
-
+* **Core Engine:** Python 3.12+, FastAPI, Uvicorn, Asyncio, OS Threading
+* **Dashboard UI:** Streamlit, Pandas, Plotly
+* **Database:** SQLite3 (WAL Mode, `synchronous=NORMAL` for high-concurrency)
+* **Networking:** PyNgrok (Dynamic tunneling), HTTPX (Connection Pooling)
 
 ---
 
-## 🛑 Troubleshooting
+## ⚙️ Installation & Setup
 
-* **Database is Locked Error:** This occurs if multiple processes try to write to the SQLite database at the exact same millisecond. V6 utilizes WAL (Write-Ahead Logging) and sequential connection closing to mitigate this.
-* **Ngrok 502 / ERR_NGROK_334:** If the engine crashes and fails to release the ngrok tunnel, the cloud server will block the new connection. Wait 60 seconds for the cloud to timeout, run `taskkill /f /im ngrok.exe`, and restart the engine.
-* **UI Not Updating:** The Streamlit dashboard refreshes automatically every 5 seconds. If the Audit Trail is not appearing, ensure the browser tab is refreshed.
+Robosh V6.3 is fully cross-platform. Ensure you have **Python 3.12+** and **Git** installed on your system before beginning.
+
+### 1. Clone & Prepare the Environment
+
+**For Windows:**
+Open Command Prompt and run the following lines one by one:
+`git clone <your-repository-url> C:\TradingBot`
+`cd C:\TradingBot`
+`python -m venv venv`
+`call venv\Scripts\activate`
+`pip install fastapi uvicorn httpx pyngrok telebot streamlit pandas plotly pytz`
+
+**For macOS / Linux:**
+Open Terminal and run the following lines one by one:
+`git clone <your-repository-url> ~/TradingBot`
+`cd ~/TradingBot`
+`python3 -m venv venv`
+`source venv/bin/activate`
+`pip install fastapi uvicorn httpx pyngrok telebot streamlit pandas plotly pytz`
+
+### 2. Configure Credentials (config.json)
+Create a `config.json` file in the root directory. This holds your routing endpoints and secure passphrase.
+
+{
+  "credentials": {
+    "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "telegram_chat_id": "YOUR_CHAT_ID",
+    "ngrok_auth_token": "YOUR_NGROK_TOKEN",
+    "secret_passphrase": "YourSecretPassphrase"
+  },
+  "ghost_urls": {
+    "MNQ": "https://api.ghost.com/webhook/mnq_endpoint",
+    "MES": "https://api.ghost.com/webhook/mes_endpoint",
+    "MGC": "https://api.ghost.com/webhook/mgc_endpoint"
+  }
+}
+
+### 3. TradingView Webhook Configuration
+Set your TradingView alert to send webhooks to your generated Ngrok URL (e.g., `https://<your-ngrok>.ngrok-free.app/tv-webhook`). 
+
+The payload **must** match this exact structure to support the dual-action routing (Safe vs. Bypass):
+
+{
+  "passphrase": "YourSecretPassphrase",
+  "strategy": "thirdparty_ak_strategy",
+  "action": "{{strategy.order.id}}",
+  "market_position": "{{strategy.market_position}}",
+  "symbol": "{{ticker}}",
+  "price": {{close}},
+  "filter_action": "{{strategy.order.action}}"
+}
+
+> **Prop Firm Compliance Tip:** If you are trading with **The5ers**, remember that they strictly require all stop-loss orders to be visible in the trading platform. Ensure your TradingView strategy properties are configured to send hard Stop Loss commands along with the initial entry, rather than relying on mental or delayed script stops.
+
+---
+
+## 🖥️ Running the System
+
+Robosh V6.3 uses a split-process architecture to ensure UI rendering never throttles trade execution.
+
+### For Windows Users
+We have provided a unified launcher. Simply double-click the **start_all.bat** file.
+1. It launches the Execution Engine (`main.py`) in a background terminal.
+2. It waits exactly 5 seconds for the database and OS Heartbeat to initialize.
+3. It launches the Streamlit Dashboard (`dashboard.py`) in your default web browser.
+
+### For macOS / Linux Users
+Create a unified launcher script named `start_all.sh` in your root directory and run it.
+
+---
+
+## 🛡️ VPS Production Deployment Best Practices
+
+If deploying to a 24/7 Virtual Private Server:
+* **Windows Server VPS:** Create shortcut `.lnk` files for your `.bat` scripts and place them in the `shell:startup` folder. **Crucial:** Always disconnect from your VPS by clicking the "X" on the Remote Desktop window. Using "Sign Out" or "Log Off" will terminate the bot's background processes.
+* **Linux VPS (Ubuntu/Debian):** It is highly recommended to run the `start_all.sh` script inside a `tmux` or `screen` session, or configure it as a `systemd` background service to ensure it survives SSH disconnections.

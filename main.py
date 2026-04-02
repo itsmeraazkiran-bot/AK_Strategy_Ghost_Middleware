@@ -6,7 +6,7 @@ import asyncio
 import threading
 import re
 import time
-import sys # <-- Added
+import sys
 from datetime import datetime, timedelta
 import pytz
 from contextlib import asynccontextmanager
@@ -64,86 +64,53 @@ def init_db():
     conn.execute("CREATE TABLE IF NOT EXISTS closed_trades (timestamp TEXT, symbol TEXT, direction TEXT, close_price REAL)")
     conn.execute("CREATE TABLE IF NOT EXISTS system_state (key TEXT PRIMARY KEY, value TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS webhook_audits (timestamp TEXT, symbol TEXT, action TEXT, tv_inbound TEXT, ghost_outbound TEXT, ghost_response TEXT)")
-    conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('status', 'RUNNING')")
+    
+    for col in ['pnl', 'slippage', 'qty', 'tv_price', 'broker_price']:
+        try: conn.execute(f"ALTER TABLE closed_trades ADD COLUMN {col} REAL")
+        except: pass
+    for col in ['is_win', 'mode', 'exit_reason']:
+        try: conn.execute(f"ALTER TABLE closed_trades ADD COLUMN {col} TEXT")
+        except: pass
+    for col in ['tv_price', 'broker_price']:
+        try: conn.execute(f"ALTER TABLE positions ADD COLUMN {col} REAL")
+        except: pass
+    try: conn.execute("ALTER TABLE positions ADD COLUMN mode TEXT")
+    except: pass
+
+    conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('execution_mode', 'SAFE')")
+    conn.execute("INSERT OR IGNORE INTO system_state (key, value) VALUES ('last_heartbeat', 'UNKNOWN')")
     conn.commit()
     conn.close()
 
-async def fetch_daily_data():
-    try:
-        sessions = {
-            "Sydney": {"open": 22, "close": 7},
-            "Tokyo": {"open": 23, "close": 8},
-            "London": {"open": 8, "close": 16},
-            "New York": {"open": 13, "close": 22}
-        }
-        
-        events = []
-        async with httpx.AsyncClient() as client:
-            res = await client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10.0)
-            if res.status_code == 200:
-                data = res.json()
-                vps_tz = datetime.now().astimezone().tzinfo
-                
-                for item in data:
-                    impact = str(item.get("impact", "")).title()
-                    if impact in ["High", "Medium"]:
-                        try:
-                            event_utc = datetime.fromisoformat(item["date"])
-                            if event_utc.tzinfo is None:
-                                event_utc = event_utc.replace(tzinfo=pytz.utc)
-                            
-                            event_local = event_utc.astimezone(vps_tz)
-                            events.append({
-                                "title": item.get("title", ""),
-                                "currency": item.get("country", ""),
-                                "impact": impact,
-                                "timestamp_iso": event_local.isoformat(),
-                                "forecast": item.get("forecast", ""),
-                                "previous": item.get("previous", "")
-                            })
-                        except: pass
-
-        conn = sqlite3.connect("trades.db", timeout=10)
-        conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('market_sessions', ?)", (json.dumps(sessions),))
-        conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('calendar_events', ?)", (json.dumps(events),))
-        conn.commit()
-        conn.close()
-        log_msg("📅 Daily Calendar & Session Times Updated.", to_tg=False)
-    except Exception as e:
-        log_msg(f"⚠️ Failed to fetch daily calendar: {e}", to_tg=False)
-
-async def daily_maintenance_loop():
-    await fetch_daily_data()
+# --- 💓 ISOLATED THREAD HEARTBEAT (Zero-Latency Guarantee) ---
+def heartbeat_worker():
+    """Runs on a dedicated OS thread so it NEVER blocks the execution event loop."""
     while True:
-        now = datetime.now()
-        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=1, second=0, microsecond=0)
-        await asyncio.sleep((next_midnight - now).total_seconds())
-        await fetch_daily_data()
+        try:
+            conn = sqlite3.connect("trades.db", timeout=10)
+            conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('last_heartbeat', ?)", (get_vps_time(),))
+            conn.commit(); conn.close()
+        except: pass
+        time.sleep(5)
 
-if bot:
-    @bot.message_handler(commands=['status', 'positions', 'closed'])
-    def handle_commands(message):
-        if str(message.chat.id) != str(TELEGRAM_CHAT_ID): return
-        cmd = message.text.replace('/', '')
-        conn = sqlite3.connect("trades.db", timeout=10)
-        if cmd == 'status':
-            status = conn.execute("SELECT value FROM system_state WHERE key='status'").fetchone()[0]
-            bot.reply_to(message, f"🖥️ Engine Status: <b>{status}</b>\n⏱️ VPS Time: {get_vps_time()}", parse_mode="HTML")
-        elif cmd == 'positions':
-            rows = conn.execute("SELECT symbol, direction, entry_price FROM positions").fetchall()
-            bot.reply_to(message, "🎯 <b>Open Positions:</b>\n" + "\n".join([f"• {r[0]}: {r[1].upper()} @ {r[2]}" for r in rows]) if rows else "No active positions.", parse_mode="HTML")
-        elif cmd == 'closed':
-            today = get_vps_time().split(" ")[0]
-            rows = conn.execute("SELECT symbol, direction, close_price FROM closed_trades WHERE timestamp LIKE ?", (f"{today}%",)).fetchall()
-            bot.reply_to(message, f"🏁 <b>Closed Trades ({today}):</b>\n" + "\n".join([f"• {r[0]}: {r[1].upper()} @ {r[2]}" for r in rows]) if rows else "No closed trades today.", parse_mode="HTML")
-        conn.close()
-
-    def start_telegram_polling():
-        try: bot.set_my_commands([telebot.types.BotCommand("status", "Check status"), telebot.types.BotCommand("positions", "List open trades"), telebot.types.BotCommand("closed", "Today's trades")])
-        except Exception as e: pass
-        while True:
-            try: bot.infinity_polling(timeout=20, long_polling_timeout=15)
-            except: time.sleep(10)
+def extract_ghost_data(response_text):
+    metrics = {"pnl": None, "is_win": None, "slippage": 0.0, "qty_filled": 0.0, "broker_entry": None, "broker_exit": None, "status": "unknown", "exit_reason": "UNKNOWN"}
+    try:
+        parts = response_text.split("Response: ")
+        if len(parts) > 1:
+            data = json.loads(parts[1])
+            pos = data.get("position", {})
+            metrics["pnl"] = data.get("pnl") if data.get("pnl") is not None else pos.get("pnl")
+            metrics["is_win"] = data.get("isWin")
+            if isinstance(pos, dict):
+                metrics["slippage"] = float(pos.get("entry_slippage") or 0.0) + float(pos.get("exit_slippage") or 0.0)
+                metrics["qty_filled"] = float(pos.get("quantity_filled") or 0.0)
+                metrics["broker_entry"] = pos.get("broker_entry_price") or pos.get("entry_price")
+                metrics["broker_exit"] = pos.get("broker_exit_price") or pos.get("exit_price")
+                metrics["status"] = pos.get("status", "unknown")
+                metrics["exit_reason"] = pos.get("exit_reason", "MANUAL/WEBHOOK")
+    except: pass
+    return metrics
 
 async def market_close_report_loop():
     reported_today = False
@@ -153,11 +120,70 @@ async def market_close_report_loop():
         if current_time == "00:00": reported_today = False
         if current_time == "17:00" and not reported_today:
             conn = sqlite3.connect("trades.db", timeout=10)
-            rows = conn.execute("SELECT symbol, direction, close_price FROM closed_trades WHERE timestamp LIKE ?", (f"{today}%",)).fetchall()
+            rows = conn.execute("SELECT symbol, direction, broker_price, pnl, is_win FROM closed_trades WHERE timestamp LIKE ?", (f"{today}%",)).fetchall()
             conn.close()
-            send_telegram_bg(f"📊 <b>EOD Market Report ({today}):</b>\n" + "\n".join([f"• {r[0]}: {r[1].upper()} @ {r[2]}" for r in rows]) if rows else f"📊 <b>EOD Market Report ({today}):</b>\nNo trades executed today.")
+            report = f"📊 <b>EOD Market Report ({today}):</b>\n"
+            if rows:
+                total_pnl = sum([r[3] for r in rows if r[3] is not None])
+                report += f"💵 <b>Total PNL: ${total_pnl:.2f}</b>\n\n"
+                for r in rows:
+                    pnl_str = f" | PNL: ${r[3]:.2f} {r[4]}" if r[3] is not None else ""
+                    report += f"• {r[0]}: {r[1].upper()} @ {r[2]}{pnl_str}\n"
+            else: report += "No trades executed today."
+            send_telegram_bg(report)
             reported_today = True
         await asyncio.sleep(60)
+
+async def fetch_market_bias():
+    bias_data = {}
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    async def get_asset_data(ticker, name):
+        try:
+            async with httpx.AsyncClient() as client:
+                chart_res = await client.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2d", headers=headers, timeout=10.0)
+                chart = chart_res.json()
+                closes = chart['chart']['result'][0]['indicators']['quote'][0]['close']
+                prev_close, current = closes[0], closes[-1]
+                trend = "🐂 Bullish" if current > prev_close else "🐻 Bearish"
+                change = ((current - prev_close) / prev_close) * 100
+                news_res = await client.get(f"https://query2.finance.yahoo.com/v1/finance/search?q={name}&newsCount=3", headers=headers, timeout=10.0)
+                news = [n['title'] for n in news_res.json().get('news', [])][:2]
+                return {"trend": trend, "change": f"{change:+.2f}%", "price": f"{current:,.2f}", "news": news}
+        except: return {"trend": "Neutral", "change": "0.00%", "price": "N/A", "news": ["Market data unavailable"]}
+    bias_data["Nasdaq (MNQ)"] = await get_asset_data("NQ=F", "Nasdaq")
+    bias_data["Gold (MGC)"] = await get_asset_data("GC=F", "Gold")
+    return bias_data
+
+async def fetch_daily_data():
+    try:
+        sessions = {"Sydney": {"open": 22, "close": 7}, "Tokyo": {"open": 23, "close": 8}, "London": {"open": 8, "close": 16}, "New York": {"open": 13, "close": 22}}
+        events = []
+        async with httpx.AsyncClient() as client:
+            res = await client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10.0)
+            if res.status_code == 200:
+                vps_tz = datetime.now().astimezone().tzinfo
+                for item in res.json():
+                    impact = str(item.get("impact", "")).title()
+                    if impact in ["High", "Medium"]:
+                        try:
+                            event_utc = datetime.fromisoformat(item["date"])
+                            if event_utc.tzinfo is None: event_utc = event_utc.replace(tzinfo=pytz.utc)
+                            events.append({"title": item.get("title", ""), "currency": item.get("country", ""), "impact": impact, "timestamp_iso": event_utc.astimezone(vps_tz).isoformat(), "forecast": item.get("forecast", ""), "previous": item.get("previous", "")})
+                        except: pass
+        market_bias = await fetch_market_bias()
+        conn = sqlite3.connect("trades.db", timeout=10)
+        conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('market_sessions', ?)", (json.dumps(sessions),))
+        conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('calendar_events', ?)", (json.dumps(events),))
+        conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('market_bias', ?)", (json.dumps(market_bias),))
+        conn.commit(); conn.close()
+        log_msg("📅 Market Bias, Calendar & Sessions Updated.", to_tg=False)
+    except Exception as e: log_msg(f"⚠️ Failed to fetch daily data: {e}", to_tg=False)
+
+async def daily_maintenance_loop():
+    await fetch_daily_data()
+    while True:
+        await asyncio.sleep(14400) 
+        await fetch_daily_data()
 
 async def send_to_ghost(symbol: str, action: str, price: float, qty: float):
     global http_client
@@ -172,107 +198,170 @@ async def send_to_ghost(symbol: str, action: str, price: float, qty: float):
 async def process_signal(tv_payload: dict):
     try:
         pending_logs = []
-        raw_action = str(tv_payload.get("action") or "").lower()
+        tv_action_id = str(tv_payload.get("action") or "") 
+        raw_filter_action = str(tv_payload.get("filter_action") or tv_action_id).lower() 
         raw_symbol = str(tv_payload.get("symbol") or "")
         market_pos = str(tv_payload.get("market_position") or "").lower()
-        
-        try: price = float(tv_payload.get("price") or 0.0)
-        except: price = 0.0
-        try: qty = float(tv_payload.get("qty") or 1.0)
-        except: qty = 1.0
-
+        tv_price = float(tv_payload.get("price") or 0.0)
+        qty = float(tv_payload.get("qty") or 1.0)
         symbol = clean_symbol(raw_symbol)
-        action = 'exit' if raw_action in ['close', 'flat'] else raw_action
         
-        # 1. Primary Flat Check
-        if market_pos == 'flat' and action != 'exit':
-            pending_logs.append(f"🔄 TV SYNC: Strategy flat. Overriding {raw_action.upper()} to EXIT on {symbol}.")
-            action = 'exit'
-
         conn = sqlite3.connect("trades.db", timeout=10)
         c = conn.cursor()
+        try: mode = c.execute("SELECT value FROM system_state WHERE key='execution_mode'").fetchone()[0]
+        except: mode = 'SAFE'
 
-        if c.execute("SELECT value FROM system_state WHERE key='status'").fetchone()[0] == 'KILLED':
-            pending_logs.append(f"🛑 SYSTEM KILLED: Ignored {raw_action} on {symbol}")
-            conn.close()
-            for log in pending_logs: log_msg(log)
+        if mode == 'STOPPED':
+            pending_logs.append(f"🛑 ENGINE STOPPED: Ignored incoming signal on {symbol}")
+            conn.close(); [log_msg(log) for log in pending_logs]
             return
 
-        # 2. Symbol-Specific Reversal Check
+        if mode == 'BYPASS':
+            ghost_payload, ghost_response = await send_to_ghost(symbol, tv_action_id, tv_price, qty)
+            safe_tv_payload = {k: v for k, v in tv_payload.items() if k != 'passphrase'}
+            c.execute("INSERT INTO webhook_audits (timestamp, symbol, action, tv_inbound, ghost_outbound, ghost_response) VALUES (?, ?, ?, ?, ?, ?)",
+                      (get_vps_time(), symbol, tv_action_id.upper(), json.dumps(safe_tv_payload), json.dumps(ghost_payload), ghost_response))
+            
+            m = extract_ghost_data(ghost_response)
+            broker_price = m["broker_exit"] if m["broker_exit"] else (m["broker_entry"] if m["broker_entry"] else tv_price)
+
+            if m["pnl"] is not None:
+                win_str = "WIN" if m["is_win"] else "LOSS"
+                c.execute("INSERT INTO closed_trades (timestamp, symbol, direction, close_price, pnl, is_win, mode, slippage, qty, tv_price, broker_price, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (get_vps_time(), symbol, 'BYPASS', broker_price, float(m["pnl"]), win_str, 'BYPASS', m["slippage"], m["qty_filled"], tv_price, broker_price, m["exit_reason"]))
+                pending_logs.append(f"🏁 [BYPASS] CLOSED: {symbol} | Broker Fill: {broker_price} | PNL: ${float(m['pnl']):.2f} ({win_str}) | Slip: {m['slippage']}")
+            else:
+                fill_str = f" (Filled: {m['qty_filled']})" if m['qty_filled'] > 0 else ""
+                slip_str = f" | Slip: {m['slippage']}" if m['slippage'] > 0 else ""
+                pending_logs.append(f"⚡ [BYPASS] FIRED: {tv_action_id.upper()} {symbol}{fill_str}{slip_str}")
+            conn.commit(); conn.close(); [log_msg(log) for log in pending_logs]
+            return
+
+        action = 'exit' if raw_filter_action in ['close', 'flat'] else raw_filter_action
+        if market_pos == 'flat' and action != 'exit':
+            pending_logs.append(f"🔄 TV SYNC: Strategy flat. Overriding {raw_filter_action.upper()} to EXIT on {symbol}.")
+            action = 'exit'
+
         pos = c.execute("SELECT direction FROM positions WHERE symbol=?", (symbol,)).fetchone()
+        
         if pos and action != 'exit':
             if (pos[0] in ['long', 'buy'] and action in ['short', 'sell']) or (pos[0] in ['short', 'sell'] and action in ['long', 'buy']):
-                pending_logs.append(f"🔄 INTELLIGENT REVERSAL: Converted {raw_action.upper()} to EXIT for open {pos[0].upper()} on {symbol}.")
-                action = 'exit'
+                pending_logs.append(f"🔄 REVERSAL DETECTED: Flattening open {pos[0].upper()} on {symbol} before entering {action.upper()}.")
+                ghost_payload_exit, ghost_response_exit = await send_to_ghost(symbol, 'exit', tv_price, qty)
+                safe_tv_payload = {k: v for k, v in tv_payload.items() if k != 'passphrase'}
+                c.execute("INSERT INTO webhook_audits (timestamp, symbol, action, tv_inbound, ghost_outbound, ghost_response) VALUES (?, ?, ?, ?, ?, ?)",
+                          (get_vps_time(), symbol, 'REVERSAL-EXIT', json.dumps(safe_tv_payload), json.dumps(ghost_payload_exit), ghost_response_exit))
+                
+                m = extract_ghost_data(ghost_response_exit)
+                pnl_val = float(m["pnl"]) if m["pnl"] is not None else 0.0
+                win_str = ("WIN" if m["is_win"] else "LOSS") if m["pnl"] is not None else ""
+                broker_price = m["broker_exit"] if m["broker_exit"] else tv_price
+
+                c.execute("INSERT INTO closed_trades (timestamp, symbol, direction, close_price, pnl, is_win, mode, slippage, qty, tv_price, broker_price, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
+                          (get_vps_time(), symbol, pos[0], broker_price, pnl_val, win_str, 'SAFE', m["slippage"], m["qty_filled"], tv_price, broker_price, m["exit_reason"]))
+                c.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
+                pending_logs.append(f"🏁 [SAFE] CLOSED (Reversal): {symbol} | Broker Fill: {broker_price} | PNL: ${pnl_val:.2f} {win_str} | Slip: {m['slippage']}")
+                pos = None 
 
         is_entry = action in ['long', 'short', 'buy', 'sell']
-        
-        # 3. 🛡️ PROP FIRM CORRELATION ANTI-HEDGE LOCK
-        # Prevents illegal hedging across highly correlated assets (e.g., Long MNQ vs Short MES)
         if is_entry:
             target_dir = 'long' if action in ['long', 'buy'] else 'short'
-            
-            EQUITIES = {'MNQ', 'MES', 'MYM', 'M2K', 'NQ', 'ES', 'YM', 'RTY'}
-            METALS = {'MGC', 'GC', 'SIL', 'SI'}
-            
-            my_group = None
-            if symbol in EQUITIES: my_group = EQUITIES
-            elif symbol in METALS: my_group = METALS
-            
+            EQUITIES, METALS = {'MNQ', 'MES', 'MYM', 'M2K', 'NQ', 'ES', 'YM', 'RTY'}, {'MGC', 'GC', 'SIL', 'SI'}
+            my_group = EQUITIES if symbol in EQUITIES else (METALS if symbol in METALS else None)
             if my_group:
                 open_positions = c.execute("SELECT symbol, direction FROM positions").fetchall()
                 for open_sym, open_dir in open_positions:
                     if open_sym != symbol and open_sym in my_group:
                         norm_open_dir = 'long' if open_dir in ['long', 'buy'] else 'short'
                         if target_dir != norm_open_dir:
-                            pending_logs.append(f"🛡️ CORRELATION LOCK: Ignored {action.upper()} {symbol}. Correlated asset ({open_sym}) is currently {norm_open_dir.upper()}.")
-                            conn.close()
-                            for log in pending_logs: log_msg(log)
+                            pending_logs.append(f"🛡️ CORRELATION LOCK: Ignored {action.upper()} {symbol}. Correlated asset ({open_sym}) is {norm_open_dir.upper()}.")
+                            conn.commit(); conn.close(); [log_msg(log) for log in pending_logs]
                             return
 
-        # 4. Light-Speed Execution
-        ghost_payload, ghost_response = await send_to_ghost(symbol, action, price, qty)
-        
+        ghost_payload, ghost_response = await send_to_ghost(symbol, action, tv_price, qty)
         safe_tv_payload = {k: v for k, v in tv_payload.items() if k != 'passphrase'}
         c.execute("INSERT INTO webhook_audits (timestamp, symbol, action, tv_inbound, ghost_outbound, ghost_response) VALUES (?, ?, ?, ?, ?, ?)",
                   (get_vps_time(), symbol, action.upper(), json.dumps(safe_tv_payload), json.dumps(ghost_payload), ghost_response))
 
-        if is_entry:
-            c.execute("INSERT OR REPLACE INTO positions (symbol, direction, entry_price) VALUES (?, ?, ?)", (symbol, action, price))
-            pending_logs.append(f"🟢 OPENED: {action.upper()} {qty}x {symbol} @ {price}")
-        elif action == 'exit' and pos:
-            c.execute("INSERT INTO closed_trades (timestamp, symbol, direction, close_price) VALUES (?, ?, ?, ?)", (get_vps_time(), symbol, pos[0], price))
-            c.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
-            pending_logs.append(f"🏁 CLOSED: {symbol} @ {price}")
+        m = extract_ghost_data(ghost_response)
 
-        conn.commit()
-        conn.close()
+        if is_entry:
+            broker_price = m["broker_entry"] if m["broker_entry"] else tv_price
+            c.execute("INSERT OR REPLACE INTO positions (symbol, direction, entry_price, mode, tv_price, broker_price) VALUES (?, ?, ?, ?, ?, ?)", 
+                      (symbol, action, broker_price, 'SAFE', tv_price, broker_price))
+            fill_str = f" (Filled: {m['qty_filled']})" if m['qty_filled'] > 0 else ""
+            slip_str = f" | Slip: {m['slippage']}" if m['slippage'] > 0 else ""
+            pending_logs.append(f"🟢 [SAFE] OPENED: {action.upper()} {qty}x{fill_str} {symbol} | TV: {tv_price} -> Broker: {broker_price}{slip_str}")
+        elif action == 'exit' and pos:
+            pnl_val = float(m["pnl"]) if m["pnl"] is not None else 0.0
+            win_str = ("WIN" if m["is_win"] else "LOSS") if m["pnl"] is not None else ""
+            broker_price = m["broker_exit"] if m["broker_exit"] else tv_price
+            c.execute("INSERT INTO closed_trades (timestamp, symbol, direction, close_price, pnl, is_win, mode, slippage, qty, tv_price, broker_price, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
+                      (get_vps_time(), symbol, pos[0], broker_price, pnl_val, win_str, 'SAFE', m["slippage"], m["qty_filled"], tv_price, broker_price, m["exit_reason"]))
+            c.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
+            pending_logs.append(f"🏁 [SAFE] CLOSED: {symbol} | Broker Fill: {broker_price} | PNL: ${pnl_val:.2f} {win_str} | Slip: {m['slippage']}")
+
+        conn.commit(); conn.close()
         for log in pending_logs: log_msg(log)
     except Exception as e: log_msg(f"❌ ENGINE CRASH: {str(e)}")
+
+if bot:
+    @bot.message_handler(commands=['status', 'positions', 'closed'])
+    def handle_commands(message):
+        if str(message.chat.id) != str(TELEGRAM_CHAT_ID): return
+        cmd = message.text.replace('/', '')
+        conn = sqlite3.connect("trades.db", timeout=10)
+        if cmd == 'status':
+            try: mode = conn.execute("SELECT value FROM system_state WHERE key='execution_mode'").fetchone()[0]
+            except: mode = 'SAFE'
+            bot.reply_to(message, f"🖥️ Engine Mode: <b>{mode}</b>\n⏱️ VPS Time: {get_vps_time()}", parse_mode="HTML")
+        elif cmd == 'positions':
+            try: rows = conn.execute("SELECT symbol, direction, broker_price FROM positions").fetchall()
+            except: rows = conn.execute("SELECT symbol, direction, entry_price FROM positions").fetchall()
+            bot.reply_to(message, "🎯 <b>Open Positions:</b>\n" + "\n".join([f"• {r[0]}: {r[1].upper()} @ {r[2]}" for r in rows]) if rows else "No active positions.", parse_mode="HTML")
+        elif cmd == 'closed':
+            today = get_vps_time().split(" ")[0]
+            rows = conn.execute("SELECT symbol, direction, broker_price, pnl, is_win FROM closed_trades WHERE timestamp LIKE ?", (f"{today}%",)).fetchall()
+            if rows:
+                reply = f"🏁 <b>Closed Trades ({today}):</b>\n"
+                for r in rows:
+                    pnl_str = f" | PNL: ${r[3]:.2f} {r[4]}" if r[3] is not None else ""
+                    reply += f"• {r[0]}: {r[1].upper()} @ {r[2]}{pnl_str}\n"
+                bot.reply_to(message, reply, parse_mode="HTML")
+            else: bot.reply_to(message, "No closed trades today.", parse_mode="HTML")
+        conn.close()
+
+    def start_telegram_polling():
+        try: bot.set_my_commands([telebot.types.BotCommand("status", "Check status"), telebot.types.BotCommand("positions", "List open trades"), telebot.types.BotCommand("closed", "Today's trades")])
+        except Exception as e: pass
+        while True:
+            try: bot.infinity_polling(timeout=20, long_polling_timeout=15)
+            except: time.sleep(10)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(limits=httpx.Limits(max_keepalive_connections=5, max_connections=10))
     init_db()
-    
     if NGROK_AUTH_TOKEN:
         try:
             ngrok.set_auth_token(NGROK_AUTH_TOKEN)
             public_url = ngrok.connect(8001).public_url
             log_msg(f"🌐 NGROK TUNNEL ACTIVE: Set your TradingView Webhook to: {public_url}/tv-webhook")
         except Exception as e: log_msg(f"⚠️ NGROK FAILED to start: {str(e)}")
-    else: log_msg("🚀 Engine Booted. Localhost only.")
 
     conn = sqlite3.connect("trades.db", timeout=10)
     open_positions = conn.execute("SELECT symbol, direction, entry_price FROM positions").fetchall()
     conn.close()
-    
     if open_positions: log_msg(f"🔄 <b>ENGINE RESTARTED:</b> Recovered {len(open_positions)} positions.")
     if bot: threading.Thread(target=start_telegram_polling, daemon=True).start()
     
     eod_task = asyncio.create_task(market_close_report_loop())
     daily_task = asyncio.create_task(daily_maintenance_loop())
+    
+    # NEW: Run Heartbeat in isolated OS Thread to guarantee zero event-loop blocking
+    threading.Thread(target=heartbeat_worker, daemon=True).start()
+    
     yield
     eod_task.cancel()
     daily_task.cancel()
@@ -285,9 +374,7 @@ app = FastAPI(lifespan=lifespan)
 async def tv_webhook(request: Request, background_tasks: BackgroundTasks):
     try: payload = json.loads((await request.body()).decode("utf-8"))
     except: raise HTTPException(status_code=400, detail="Invalid JSON")
-
     if payload.get("passphrase") != config.get("credentials", {}).get("secret_passphrase", ""):
-        log_msg("🔑 Auth Failed: Bad Passphrase")
         raise HTTPException(status_code=401)
 
     print(f"[{get_vps_time()}] 📥 Received Signal: {payload.get('action', '')} {payload.get('symbol', '')}")
