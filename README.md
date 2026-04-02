@@ -20,6 +20,12 @@ Designed for rigorous prop-firm environments, it features native anti-hedging co
 * **Hierarchical PNL Tracker:** The dashboard dynamically extracts all historical trading dates. Users can select any date to view a nested, interactive breakdown of their trades: **Grand Total ➡️ Global Session (Asian/London/NY) ➡️ Specific Symbol ➡️ Individual Trades.**
 * **Slippage Analytics Wizard:** A live UI module that dynamically compares average slippage across assets, segmented by Safe vs. Bypass mode to identify latency costs and broker manipulation over time.
 
+<img width="1365" height="945" alt="Main" src="https://github.com/user-attachments/assets/2a38702b-c0c0-4721-9f41-bf127a1f8945" />
+<img width="1365" height="945" alt="S2" src="https://github.com/user-attachments/assets/0f07eb8f-c30c-41b0-ae8d-151f2830a774" />
+<img width="1365" height="945" alt="S1" src="https://github.com/user-attachments/assets/687ad2a2-23b1-4184-ba32-31c9cb3d1864" />
+<img width="1365" height="945" alt="S3" src="https://github.com/user-attachments/assets/7f385a9e-30d8-4651-88fd-a998e70bd2b5" />
+  
+
 ## 🛠️ Tech Stack
 
 * **Core Engine:** Python 3.12+, FastAPI, Uvicorn, Asyncio, OS Threading
