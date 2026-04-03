@@ -13,7 +13,6 @@ st.set_page_config(page_title="Robosh V6 Command Center", page_icon="⚡", layou
 def get_db(): return sqlite3.connect("trades.db", timeout=10)
 
 def get_trading_session(timestamp_str):
-    """Categorizes a local VPS timestamp into the major global trading session."""
     try:
         local_dt = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
         local_tz = datetime.now().astimezone().tzinfo
@@ -24,31 +23,7 @@ def get_trading_session(timestamp_str):
         else: return "🇯🇵/🇦🇺 Asian Session"
     except: return "Unknown Session"
 
-def get_prop_firm_day(timestamp_str):
-    """
-    Translates VPS Time to Prop Firm CME Trading Days.
-    Prop Firm days roll over at 5:00 PM EST (New York Time).
-    Trades placed after 5:00 PM EST count towards the NEXT calendar day's PNL.
-    """
-    try:
-        local_dt = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
-        local_tz = datetime.now().astimezone().tzinfo
-        utc_dt = local_dt.replace(tzinfo=local_tz).astimezone(pytz.utc)
-        ny_tz = pytz.timezone('America/New_York')
-        ny_dt = utc_dt.astimezone(ny_tz)
-        
-        # If the trade occurred at or after 17:00 (5 PM NY Time), it belongs to tomorrow's prop firm day.
-        if ny_dt.hour >= 17:
-            trading_day = (ny_dt + timedelta(days=1)).date()
-        else:
-            trading_day = ny_dt.date()
-            
-        return trading_day.strftime('%Y-%m-%d')
-    except:
-        return timestamp_str[:10]
-
 st.title("⚡ Robosh V6 Command Center")
-
 conn = get_db()
 
 # --- 💓 ENGINE HEALTH CHECK ---
@@ -60,20 +35,72 @@ try:
             st.success("### 🟢 SYSTEM HEALTH: ONLINE\nEngine is actively running and listening for webhooks.")
         else:
             st.error(f"### 🔴 SYSTEM HEALTH: OFFLINE\nEngine is not responding! (Last heartbeat: {hb_data[0]}). Restart `run_engine.bat`.")
-    else:
-        st.warning("### 🟡 SYSTEM HEALTH: UNKNOWN\nAwaiting engine heartbeat...")
-except Exception as e:
-    st.error("### 🔴 SYSTEM HEALTH: OFFLINE\nCould not read engine status from database.")
+    else: st.warning("### 🟡 SYSTEM HEALTH: UNKNOWN\nAwaiting engine heartbeat...")
+except: st.error("### 🔴 SYSTEM HEALTH: OFFLINE\nCould not read engine status from database.")
 
 try: mode = conn.execute("SELECT value FROM system_state WHERE key='execution_mode'").fetchone()[0]
 except: mode = "SAFE"
 
 st.divider()
 
+# --- 🛡️ BEAUTIFUL PROP FIRM RISK MANAGEMENT ---
+st.markdown("### 🛡️ Prop Firm Risk Management")
+
+try:
+    g_state_data = conn.execute("SELECT value FROM system_state WHERE key='guard_state'").fetchone()
+    g_state = json.loads(g_state_data[0]) if g_state_data else {"pnl": 0.0, "hwm": 0.0, "tripped": False, "reason": ""}
+except: g_state = {"pnl": 0.0, "hwm": 0.0, "tripped": False, "reason": ""}
+
+try:
+    g_set_data = conn.execute("SELECT value FROM system_state WHERE key='guard_settings'").fetchone()
+    g_set = json.loads(g_set_data[0]) if g_set_data else {}
+except: g_set = {}
+
+def get_set(key, default): return g_set.get(key, default)
+
+metric_col1, metric_col2 = st.columns(2)
+metric_col1.info(f"**Daily Realized PNL:** `${g_state['pnl']:.2f}`")
+metric_col2.success(f"**High-Water Mark:** `${g_state['hwm']:.2f}`")
+
+if g_state['tripped']:
+    st.error(f"### 🚨 ENGINE HALTED: {g_state['reason']}\nEngine is in FLAT-ONLY mode. New entries are blocked. Exits are permitted.")
+    if st.button("⚠️ MASTER RESET: Wipe PNL & Unlock Engine", type="primary", use_container_width=True):
+        conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('guard_reset', '1')")
+        conn.commit(); st.rerun()
+
+with st.expander("⚙️ Configure Independent Guards", expanded=False):
+    st.caption("Use these independent kill-switches to protect your funded account or evaluation. The engine evaluates these in 0.00ms via Global RAM.")
+    with st.form("guard_form"):
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("#### 🛑 Risk Limits")
+            ml_on = st.checkbox("Enable Max Daily Loss", value=get_set("max_loss_on", False), key="ml_on")
+            ml_val = st.number_input("Halt if PNL drops below ($):", value=get_set("max_loss", -500.0), step=50.0)
+            st.markdown("---")
+            st.markdown("#### 🎯 Target Limits")
+            tg_on = st.checkbox("Enable Daily Profit Target", value=get_set("target_on", False), key="tg_on")
+            tg_val = st.number_input("Halt if PNL hits ($):", value=get_set("target", 2000.0), step=100.0)
+        with colB:
+            st.markdown("#### 🛡️ Ratchet Trail (Step-Shield)")
+            rt_on = st.checkbox("Enable Ratchet Trail", value=get_set("ratchet_on", False), key="rt_on")
+            rt_act = st.number_input("Activate when HWM hits ($):", value=get_set("ratchet_act", 500.0), step=50.0)
+            rt_trail = st.number_input("Trailing Distance ($):", value=get_set("ratchet_trail", 250.0), step=50.0)
+            st.markdown("---")
+            st.markdown("#### 📏 Consistency Guard")
+            cs_on = st.checkbox("Enable Consistency Limit", value=get_set("consist_on", False), key="cs_on")
+            cs_val = st.number_input("Halt at Limit ($):", value=get_set("consist", 1500.0), step=100.0)
+            
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.form_submit_button("💾 Save Guard Configurations", use_container_width=True):
+            new_settings = {"max_loss_on": ml_on, "max_loss": ml_val, "ratchet_on": rt_on, "ratchet_act": rt_act, "ratchet_trail": rt_trail, "target_on": tg_on, "target": tg_val, "consist_on": cs_on, "consist": cs_val}
+            conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('guard_settings', ?)", (json.dumps(new_settings),))
+            conn.commit(); st.success("Settings saved successfully."); time.sleep(1); st.rerun()
+
+st.divider()
+
 # --- ⚙️ EXECUTION MODE CONTROL PANEL ---
 st.markdown("### ⚙️ Engine Execution Mode")
 col1, col2, col3 = st.columns(3)
-
 with col1:
     if mode == 'SAFE': st.info("### 🛡️ SAFE MODE ACTIVE\nAnti-Hedge & Reversal logic is **ON**.")
     else:
@@ -81,7 +108,6 @@ with col1:
             conn.execute("UPDATE system_state SET value='SAFE' WHERE key='execution_mode'")
             conn.execute("INSERT INTO logs (timestamp, message) VALUES (datetime('now', 'localtime'), '🛡️ ENGINE SET TO SAFE MODE (Checks Enabled)')")
             conn.commit(); st.rerun()
-
 with col2:
     if mode == 'BYPASS': st.warning("### ⚡ BYPASS ACTIVE\nRaw signals passing directly to broker.")
     else:
@@ -89,7 +115,6 @@ with col2:
             conn.execute("UPDATE system_state SET value='BYPASS' WHERE key='execution_mode'")
             conn.execute("INSERT INTO logs (timestamp, message) VALUES (datetime('now', 'localtime'), '⚡ ENGINE SET TO BYPASS MODE (Raw Passthrough)')")
             conn.commit(); st.rerun()
-
 with col3:
     if mode == 'STOPPED': st.error("### 🛑 ENGINE STOPPED\nIgnoring all incoming webhooks.")
     else:
@@ -115,7 +140,6 @@ with dash_col1:
             x_times, y_sydney, y_tokyo, y_london, y_ny, y_vol = [], [], [], [], [], []
             midnight_local = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
             nan = float('nan') 
-            
             for i in range(25):
                 hr_local = midnight_local + timedelta(hours=i)
                 hr_utc = hr_local.astimezone(pytz.utc).hour
@@ -132,15 +156,10 @@ with dash_col1:
             fig.add_trace(go.Scatter(x=x_times, y=y_london, mode='lines', line=dict(color='#2BCBBA', width=20), name='London'), row=1, col=1)
             fig.add_trace(go.Scatter(x=x_times, y=y_ny, mode='lines', line=dict(color='#20BF6B', width=20), name='New York'), row=1, col=1)
             fig.add_trace(go.Scatter(x=x_times, y=y_vol, fill='tozeroy', mode='lines', line=dict(color='#F7B731', width=2), name='Volume'), row=2, col=1)
-
             fig.add_trace(go.Scatter(x=[vps_now, vps_now], y=[0.5, 4.5], mode='lines', line=dict(color='red', width=2, dash='dash'), hoverinfo='none', showlegend=False), row=1, col=1)
             fig.add_trace(go.Scatter(x=[vps_now, vps_now], y=[0, 100], mode='lines', line=dict(color='red', width=2, dash='dash'), hoverinfo='none', showlegend=False), row=2, col=1)
 
-            fig.update_layout(height=350, margin=dict(l=0, r=0, t=20, b=0), plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', showlegend=False, hovermode="x unified",
-                xaxis=dict(type='date', tickformat="%I:%M %p", showgrid=True, gridcolor='rgba(255,255,255,0.1)'),
-                yaxis=dict(showgrid=False, zeroline=False, tickmode='array', tickvals=[1,2,3,4], ticktext=['New York', 'London', 'Tokyo', 'Sydney'], range=[0.5, 4.5]),
-                yaxis2=dict(showgrid=False, zeroline=False, showticklabels=False)
-            )
+            fig.update_layout(height=350, margin=dict(l=0, r=0, t=20, b=0), plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)', showlegend=False, hovermode="x unified", xaxis=dict(type='date', tickformat="%I:%M %p", showgrid=True, gridcolor='rgba(255,255,255,0.1)'), yaxis=dict(showgrid=False, zeroline=False, tickmode='array', tickvals=[1,2,3,4], ticktext=['New York', 'London', 'Tokyo', 'Sydney'], range=[0.5, 4.5]), yaxis2=dict(showgrid=False, zeroline=False, showticklabels=False))
             st.plotly_chart(fig, use_container_width=True)
         else: st.caption("Awaiting initial daily sync...")
     except Exception as e: st.caption(f"Error drawing timeline: {e}")
@@ -198,7 +217,7 @@ with col_log:
         conn.execute("DELETE FROM logs")
         conn.commit(); st.rerun()
     try:
-        logs_df = pd.read_sql_query("SELECT timestamp, message FROM logs ORDER BY timestamp DESC LIMIT 50", conn)
+        logs_df = pd.read_sql_query("SELECT timestamp, message FROM logs ORDER BY timestamp DESC LIMIT 30", conn)
         if not logs_df.empty: st.dataframe(logs_df, use_container_width=True, hide_index=True, height=500)
         else: st.info("No logs yet. Awaiting signals...")
     except: st.warning("Database initializing...")
@@ -218,64 +237,40 @@ with col_pos:
                 if st.button("🗑️ Force Clear", use_container_width=True):
                     conn.execute("DELETE FROM positions WHERE symbol=?", (symbol_to_remove,))
                     conn.execute("INSERT INTO logs (timestamp, message) VALUES (datetime('now', 'localtime'), ?)", (f"🔧 MANUAL SYNC: Force cleared {symbol_to_remove} from database.",))
-                    conn.commit()
-                    st.rerun()
+                    conn.commit(); st.rerun()
         else: st.info("No active positions tracked.")
-    except Exception as e: pass
+    except: pass
 
-    # --- PNL SESSION TRACKER (PROP FIRM HIERARCHICAL) ---
-    st.subheader("🏁 Prop Firm PNL Tracker & Consistency")
+    # --- PNL SESSION TRACKER ---
+    st.subheader("🏁 Intraday Session PNL")
     try:
-        try: closed_df = pd.read_sql_query("SELECT timestamp, symbol, direction, tv_price, broker_price, pnl, is_win, slippage, exit_reason, mode FROM closed_trades ORDER BY timestamp DESC", conn)
-        except: closed_df = pd.read_sql_query("SELECT timestamp, symbol, direction, close_price, pnl, is_win, mode FROM closed_trades ORDER BY timestamp DESC", conn)
+        try: closed_df = pd.read_sql_query("SELECT timestamp, symbol, direction, tv_price, broker_price, pnl, is_win, slippage, exit_reason, mode FROM closed_trades ORDER BY timestamp DESC LIMIT 30", conn)
+        except: closed_df = pd.read_sql_query("SELECT timestamp, symbol, direction, close_price, pnl, is_win, mode FROM closed_trades ORDER BY timestamp DESC LIMIT 30", conn)
         
         if not closed_df.empty:
             closed_df['pnl'] = pd.to_numeric(closed_df['pnl'], errors='coerce').fillna(0.0)
+            today_str = vps_now.strftime('%Y-%m-%d')
+            today_df = closed_df[closed_df['timestamp'].str.startswith(today_str)].copy()
             
-            # --- VITAL: Map trades to official Prop Firm Calendar Day ---
-            closed_df['Prop_Firm_Day'] = closed_df['timestamp'].apply(get_prop_firm_day)
-            
-            available_dates = closed_df['Prop_Firm_Day'].unique().tolist()
-            current_pf_day = get_prop_firm_day(vps_now.strftime('%Y-%m-%d %H:%M:%S'))
-            
-            if current_pf_day not in available_dates: available_dates.insert(0, current_pf_day)
-            
-            col_date, _ = st.columns([1.5, 1])
-            with col_date:
-                selected_date = st.selectbox("📅 Prop Firm Trading Day (CME Boundaries)", available_dates, index=0)
-            
-            day_df = closed_df[closed_df['Prop_Firm_Day'] == selected_date].copy()
-            
-            if not day_df.empty:
-                day_df['Session'] = day_df['timestamp'].apply(get_trading_session)
+            if not today_df.empty:
+                today_pnl = today_df['pnl'].sum()
+                if today_pnl >= 0: st.success(f"## 💵 Grand Total Daily PNL: +${today_pnl:.2f}")
+                else: st.error(f"## 🔻 Grand Total Daily PNL: -${abs(today_pnl):.2f}")
+                
+                today_df['Session'] = today_df['timestamp'].apply(get_trading_session)
                 
                 def style_pnl(val):
                     try: return 'color: #20BF6B' if float(val) > 0 else 'color: #FC427B' if float(val) < 0 else ''
                     except: return ''
 
-                # Hierarchical UI: Group by Session -> Symbol
-                for session_name, session_df in day_df.groupby('Session', sort=False):
-                    session_pnl = session_df['pnl'].sum()
-                    session_icon = "🟢" if session_pnl >= 0 else "🔴"
-                    
-                    with st.expander(f"{session_icon} {session_name} | Session Subtotal: ${session_pnl:.2f}", expanded=True):
-                        for symbol_name, symbol_df in session_df.groupby('symbol', sort=False):
-                            symbol_pnl = symbol_df['pnl'].sum()
-                            sym_color = "green" if symbol_pnl >= 0 else "red"
-                            st.markdown(f"**🔹 {symbol_name}** (Symbol PNL: :{sym_color}[${symbol_pnl:.2f}])")
-                            
-                            display_df = symbol_df.drop(columns=['Prop_Firm_Day', 'Session'])
-                            st.dataframe(display_df.style.map(style_pnl, subset=['pnl']), use_container_width=True, hide_index=True)
-                
-                # Bottom Grand Total
-                st.divider()
-                grand_total = day_df['pnl'].sum()
-                if grand_total >= 0: st.success(f"## 💵 PROP FIRM DAILY TOTAL: +${grand_total:.2f}")
-                else: st.error(f"## 🔻 PROP FIRM DAILY TOTAL: -${abs(grand_total):.2f}")
-            else:
-                st.info(f"No trades exist for Prop Firm Day {selected_date}.")
+                for session_name, group_df in today_df.groupby('Session', sort=False):
+                    session_pnl = group_df['pnl'].sum()
+                    st.markdown(f"#### {session_name} (Subtotal: **${session_pnl:.2f}**)")
+                    display_df = group_df.drop(columns=['Session'])
+                    st.dataframe(display_df.style.map(style_pnl, subset=['pnl']), use_container_width=True, hide_index=True)
+            else: st.info("No closed trades today.")
         else: st.info("No closed trades yet.")
-    except Exception as e: st.caption(f"Awaiting initial trades for PNL history... ({e})")
+    except Exception as e: st.caption("Awaiting initial trades for PNL history...")
 
 st.divider()
 
@@ -336,5 +331,5 @@ try:
 except Exception as e: st.warning("Audit trail initializing...")
 
 conn.close()
-time.sleep(5)
+time.sleep(2)
 st.rerun()

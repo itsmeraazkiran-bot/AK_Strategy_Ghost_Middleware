@@ -21,6 +21,18 @@ if sys.platform == 'win32':
 SYMBOL_REGEX = re.compile(r"^([A-Za-z]+)")
 http_client = None
 
+# --- GLOBAL RAM CACHE FOR 0ms ZERO-LATENCY GUARDS ---
+PROP_GUARDS = {
+    "max_loss_on": False, "max_loss": -500.0,
+    "ratchet_on": False, "ratchet_act": 500.0, "ratchet_trail": 250.0,
+    "target_on": False, "target": 2000.0,
+    "consist_on": False, "consist": 1500.0,
+    "pnl": 0.0,
+    "hwm": 0.0,
+    "tripped": False,
+    "reason": ""
+}
+
 def get_vps_time():
     return datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -82,16 +94,61 @@ def init_db():
     conn.commit()
     conn.close()
 
-# --- 💓 ISOLATED THREAD HEARTBEAT (Zero-Latency Guarantee) ---
-def heartbeat_worker():
-    """Runs on a dedicated OS thread so it NEVER blocks the execution event loop."""
+# --- 💓 BACKGROUND WORKER: HEARTBEAT & GUARD SYNC ---
+def background_worker():
     while True:
         try:
             conn = sqlite3.connect("trades.db", timeout=10)
             conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('last_heartbeat', ?)", (get_vps_time(),))
+            
+            st_row = conn.execute("SELECT value FROM system_state WHERE key='guard_settings'").fetchone()
+            if st_row:
+                settings = json.loads(st_row[0])
+                PROP_GUARDS.update(settings)
+            
+            rst = conn.execute("SELECT value FROM system_state WHERE key='guard_reset'").fetchone()
+            if rst and rst[0] == '1':
+                PROP_GUARDS["pnl"], PROP_GUARDS["hwm"] = 0.0, 0.0
+                PROP_GUARDS["tripped"], PROP_GUARDS["reason"] = False, ""
+                conn.execute("UPDATE system_state SET value='0' WHERE key='guard_reset'")
+                log_msg("⚠️ PROP GUARDS MANUALLY RESET. ENGINE UNLOCKED.")
+
+            state = {"pnl": PROP_GUARDS["pnl"], "hwm": PROP_GUARDS["hwm"], "tripped": PROP_GUARDS["tripped"], "reason": PROP_GUARDS["reason"]}
+            conn.execute("INSERT OR REPLACE INTO system_state (key, value) VALUES ('guard_state', ?)", (json.dumps(state),))
+            
             conn.commit(); conn.close()
         except: pass
-        time.sleep(5)
+        time.sleep(2)
+
+def evaluate_prop_guards():
+    if PROP_GUARDS["tripped"]: return
+    p, h = PROP_GUARDS["pnl"], PROP_GUARDS["hwm"]
+    if PROP_GUARDS.get("max_loss_on") and p <= PROP_GUARDS.get("max_loss", -500):
+        PROP_GUARDS["tripped"], PROP_GUARDS["reason"] = True, f"Max Daily Loss Hit (${p:.2f})"
+    elif PROP_GUARDS.get("target_on") and p >= PROP_GUARDS.get("target", 2000):
+        PROP_GUARDS["tripped"], PROP_GUARDS["reason"] = True, f"Daily Target Reached (${p:.2f})"
+    elif PROP_GUARDS.get("consist_on") and p >= PROP_GUARDS.get("consist", 1500):
+        PROP_GUARDS["tripped"], PROP_GUARDS["reason"] = True, f"Consistency Limit Hit (${p:.2f})"
+    elif PROP_GUARDS.get("ratchet_on") and h >= PROP_GUARDS.get("ratchet_act", 500):
+        guard_level = h - PROP_GUARDS.get("ratchet_trail", 250)
+        if p <= guard_level:
+            PROP_GUARDS["tripped"], PROP_GUARDS["reason"] = True, f"Ratchet Trail Hit (Shield: ${guard_level:.2f})"
+            
+    if PROP_GUARDS["tripped"]:
+        log_msg(f"🚨 PROP GUARD TRIPPED: {PROP_GUARDS['reason']}. Engine restricted to FLAT-ONLY Mode.")
+
+# --- 🕔 5:00 PM EST AUTONOMOUS CME RESET LOOP ---
+async def cme_reset_loop():
+    ny_tz = pytz.timezone('America/New_York')
+    last_reset = None
+    while True:
+        now_ny = datetime.now(ny_tz)
+        if now_ny.hour == 17 and now_ny.minute == 0 and last_reset != now_ny.date():
+            PROP_GUARDS["pnl"], PROP_GUARDS["hwm"] = 0.0, 0.0
+            PROP_GUARDS["tripped"], PROP_GUARDS["reason"] = False, ""
+            last_reset = now_ny.date()
+            log_msg("🔄 CME CLOSE (5:00 PM EST): Daily PNL wiped. Prop Guards Reset.")
+        await asyncio.sleep(30)
 
 def extract_ghost_data(response_text):
     metrics = {"pnl": None, "is_win": None, "slippage": 0.0, "qty_filled": 0.0, "broker_entry": None, "broker_exit": None, "status": "unknown", "exit_reason": "UNKNOWN"}
@@ -195,6 +252,7 @@ async def send_to_ghost(symbol: str, action: str, price: float, qty: float):
         return payload, f"Status: {res.status_code} | Response: {res.text}"
     except Exception as e: return payload, f"❌ ERROR: {str(e)}"
 
+# --- UNIFIED CROSS-MODE EXECUTION ENGINE ---
 async def process_signal(tv_payload: dict):
     try:
         pending_logs = []
@@ -216,90 +274,119 @@ async def process_signal(tv_payload: dict):
             conn.close(); [log_msg(log) for log in pending_logs]
             return
 
-        if mode == 'BYPASS':
-            ghost_payload, ghost_response = await send_to_ghost(symbol, tv_action_id, tv_price, qty)
-            safe_tv_payload = {k: v for k, v in tv_payload.items() if k != 'passphrase'}
-            c.execute("INSERT INTO webhook_audits (timestamp, symbol, action, tv_inbound, ghost_outbound, ghost_response) VALUES (?, ?, ?, ?, ?, ?)",
-                      (get_vps_time(), symbol, tv_action_id.upper(), json.dumps(safe_tv_payload), json.dumps(ghost_payload), ghost_response))
-            
-            m = extract_ghost_data(ghost_response)
-            broker_price = m["broker_exit"] if m["broker_exit"] else (m["broker_entry"] if m["broker_entry"] else tv_price)
-
-            if m["pnl"] is not None:
-                win_str = "WIN" if m["is_win"] else "LOSS"
-                c.execute("INSERT INTO closed_trades (timestamp, symbol, direction, close_price, pnl, is_win, mode, slippage, qty, tv_price, broker_price, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (get_vps_time(), symbol, 'BYPASS', broker_price, float(m["pnl"]), win_str, 'BYPASS', m["slippage"], m["qty_filled"], tv_price, broker_price, m["exit_reason"]))
-                pending_logs.append(f"🏁 [BYPASS] CLOSED: {symbol} | Broker Fill: {broker_price} | PNL: ${float(m['pnl']):.2f} ({win_str}) | Slip: {m['slippage']}")
-            else:
-                fill_str = f" (Filled: {m['qty_filled']})" if m['qty_filled'] > 0 else ""
-                slip_str = f" | Slip: {m['slippage']}" if m['slippage'] > 0 else ""
-                pending_logs.append(f"⚡ [BYPASS] FIRED: {tv_action_id.upper()} {symbol}{fill_str}{slip_str}")
-            conn.commit(); conn.close(); [log_msg(log) for log in pending_logs]
-            return
-
         action = 'exit' if raw_filter_action in ['close', 'flat'] else raw_filter_action
         if market_pos == 'flat' and action != 'exit':
             pending_logs.append(f"🔄 TV SYNC: Strategy flat. Overriding {raw_filter_action.upper()} to EXIT on {symbol}.")
             action = 'exit'
 
-        pos = c.execute("SELECT direction FROM positions WHERE symbol=?", (symbol,)).fetchone()
-        
-        if pos and action != 'exit':
-            if (pos[0] in ['long', 'buy'] and action in ['short', 'sell']) or (pos[0] in ['short', 'sell'] and action in ['long', 'buy']):
-                pending_logs.append(f"🔄 REVERSAL DETECTED: Flattening open {pos[0].upper()} on {symbol} before entering {action.upper()}.")
-                ghost_payload_exit, ghost_response_exit = await send_to_ghost(symbol, 'exit', tv_price, qty)
-                safe_tv_payload = {k: v for k, v in tv_payload.items() if k != 'passphrase'}
-                c.execute("INSERT INTO webhook_audits (timestamp, symbol, action, tv_inbound, ghost_outbound, ghost_response) VALUES (?, ?, ?, ?, ?, ?)",
-                          (get_vps_time(), symbol, 'REVERSAL-EXIT', json.dumps(safe_tv_payload), json.dumps(ghost_payload_exit), ghost_response_exit))
-                
-                m = extract_ghost_data(ghost_response_exit)
-                pnl_val = float(m["pnl"]) if m["pnl"] is not None else 0.0
-                win_str = ("WIN" if m["is_win"] else "LOSS") if m["pnl"] is not None else ""
-                broker_price = m["broker_exit"] if m["broker_exit"] else tv_price
-
-                c.execute("INSERT INTO closed_trades (timestamp, symbol, direction, close_price, pnl, is_win, mode, slippage, qty, tv_price, broker_price, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
-                          (get_vps_time(), symbol, pos[0], broker_price, pnl_val, win_str, 'SAFE', m["slippage"], m["qty_filled"], tv_price, broker_price, m["exit_reason"]))
-                c.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
-                pending_logs.append(f"🏁 [SAFE] CLOSED (Reversal): {symbol} | Broker Fill: {broker_price} | PNL: ${pnl_val:.2f} {win_str} | Slip: {m['slippage']}")
-                pos = None 
-
         is_entry = action in ['long', 'short', 'buy', 'sell']
-        if is_entry:
-            target_dir = 'long' if action in ['long', 'buy'] else 'short'
-            EQUITIES, METALS = {'MNQ', 'MES', 'MYM', 'M2K', 'NQ', 'ES', 'YM', 'RTY'}, {'MGC', 'GC', 'SIL', 'SI'}
-            my_group = EQUITIES if symbol in EQUITIES else (METALS if symbol in METALS else None)
-            if my_group:
-                open_positions = c.execute("SELECT symbol, direction FROM positions").fetchall()
-                for open_sym, open_dir in open_positions:
-                    if open_sym != symbol and open_sym in my_group:
-                        norm_open_dir = 'long' if open_dir in ['long', 'buy'] else 'short'
-                        if target_dir != norm_open_dir:
-                            pending_logs.append(f"🛡️ CORRELATION LOCK: Ignored {action.upper()} {symbol}. Correlated asset ({open_sym}) is {norm_open_dir.upper()}.")
-                            conn.commit(); conn.close(); [log_msg(log) for log in pending_logs]
-                            return
 
-        ghost_payload, ghost_response = await send_to_ghost(symbol, action, tv_price, qty)
+        # 0ms RAM GUARD CHECK: Whitelist Exits, Block Entries if Tripped
+        if is_entry and PROP_GUARDS["tripped"]:
+            pending_logs.append(f"🛡️ GUARD ACTIVE ({PROP_GUARDS['reason']}): Blocked {action.upper()} on {symbol}. Waiting for exits.")
+            conn.close(); [log_msg(log) for log in pending_logs]
+            return
+
+        # Fetch local open position to enable Cross-Mode exits and logging
+        pos = c.execute("SELECT direction, mode FROM positions WHERE symbol=?", (symbol,)).fetchone()
+        
+        # SAFE MODE Logic (Reversal flattening & Correlation Locks)
+        if mode == 'SAFE':
+            if pos and action != 'exit':
+                if (pos[0] in ['long', 'buy'] and action in ['short', 'sell']) or (pos[0] in ['short', 'sell'] and action in ['long', 'buy']):
+                    pending_logs.append(f"🔄 REVERSAL DETECTED: Flattening open {pos[0].upper()} on {symbol} before entering {action.upper()}.")
+                    ghost_payload_exit, ghost_response_exit = await send_to_ghost(symbol, 'exit', tv_price, qty)
+                    safe_tv_payload = {k: v for k, v in tv_payload.items() if k != 'passphrase'}
+                    c.execute("INSERT INTO webhook_audits (timestamp, symbol, action, tv_inbound, ghost_outbound, ghost_response) VALUES (?, ?, ?, ?, ?, ?)",
+                              (get_vps_time(), symbol, 'REVERSAL-EXIT', json.dumps(safe_tv_payload), json.dumps(ghost_payload_exit), ghost_response_exit))
+                    
+                    m_exit = extract_ghost_data(ghost_response_exit)
+                    pnl_val = float(m_exit["pnl"]) if m_exit["pnl"] is not None else 0.0
+                    win_str = ("WIN" if m_exit["is_win"] else "LOSS") if m_exit["pnl"] is not None else ""
+                    broker_price = m_exit["broker_exit"] if m_exit["broker_exit"] else tv_price
+                    old_mode = pos[1]
+
+                    c.execute("INSERT INTO closed_trades (timestamp, symbol, direction, close_price, pnl, is_win, mode, slippage, qty, tv_price, broker_price, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
+                              (get_vps_time(), symbol, pos[0], broker_price, pnl_val, win_str, mode, m_exit["slippage"], m_exit["qty_filled"], tv_price, broker_price, m_exit["exit_reason"]))
+                    c.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
+                    pending_logs.append(f"🏁 [SAFE] CLOSED (Reversal): {symbol} [Opened in {old_mode}] | Broker Fill: {broker_price} | PNL: ${pnl_val:.2f} {win_str} | Slip: {m_exit['slippage']}")
+                    pos = None 
+                    
+                    PROP_GUARDS["pnl"] += pnl_val
+                    PROP_GUARDS["hwm"] = max(PROP_GUARDS["hwm"], PROP_GUARDS["pnl"])
+                    evaluate_prop_guards()
+                    
+                    if PROP_GUARDS["tripped"]:
+                        pending_logs.append(f"🛡️ GUARD TRIPPED BY REVERSAL EXIT ({PROP_GUARDS['reason']}). Halting the new entry leg.")
+                        conn.commit(); conn.close(); [log_msg(log) for log in pending_logs]
+                        return
+
+            if is_entry:
+                target_dir = 'long' if action in ['long', 'buy'] else 'short'
+                EQUITIES, METALS = {'MNQ', 'MES', 'MYM', 'M2K', 'NQ', 'ES', 'YM', 'RTY'}, {'MGC', 'GC', 'SIL', 'SI'}
+                my_group = EQUITIES if symbol in EQUITIES else (METALS if symbol in METALS else None)
+                if my_group:
+                    open_positions = c.execute("SELECT symbol, direction FROM positions").fetchall()
+                    for open_sym, open_dir in open_positions:
+                        if open_sym != symbol and open_sym in my_group:
+                            norm_open_dir = 'long' if open_dir in ['long', 'buy'] else 'short'
+                            if target_dir != norm_open_dir:
+                                pending_logs.append(f"🛡️ CORRELATION LOCK: Ignored {action.upper()} {symbol}. Correlated asset ({open_sym}) is {norm_open_dir.upper()}.")
+                                conn.commit(); conn.close(); [log_msg(log) for log in pending_logs]
+                                return
+
+        # FAST EXECUTION (UNIFIED FOR SAFE & BYPASS)
+        exec_action = tv_action_id if mode == 'BYPASS' else action
+        ghost_payload, ghost_response = await send_to_ghost(symbol, exec_action, tv_price, qty)
+        
         safe_tv_payload = {k: v for k, v in tv_payload.items() if k != 'passphrase'}
         c.execute("INSERT INTO webhook_audits (timestamp, symbol, action, tv_inbound, ghost_outbound, ghost_response) VALUES (?, ?, ?, ?, ?, ?)",
-                  (get_vps_time(), symbol, action.upper(), json.dumps(safe_tv_payload), json.dumps(ghost_payload), ghost_response))
+                  (get_vps_time(), symbol, exec_action.upper(), json.dumps(safe_tv_payload), json.dumps(ghost_payload), ghost_response))
 
         m = extract_ghost_data(ghost_response)
+        is_closing_event = (m["pnl"] is not None) or (action == 'exit')
 
-        if is_entry:
-            broker_price = m["broker_entry"] if m["broker_entry"] else tv_price
-            c.execute("INSERT OR REPLACE INTO positions (symbol, direction, entry_price, mode, tv_price, broker_price) VALUES (?, ?, ?, ?, ?, ?)", 
-                      (symbol, action, broker_price, 'SAFE', tv_price, broker_price))
-            fill_str = f" (Filled: {m['qty_filled']})" if m['qty_filled'] > 0 else ""
-            slip_str = f" | Slip: {m['slippage']}" if m['slippage'] > 0 else ""
-            pending_logs.append(f"🟢 [SAFE] OPENED: {action.upper()} {qty}x{fill_str} {symbol} | TV: {tv_price} -> Broker: {broker_price}{slip_str}")
-        elif action == 'exit' and pos:
+        # POST-EXECUTION CROSS-MODE TRACKING
+        if is_closing_event and pos:
+            # Ghost successfully closed a known position (or TV sent explicit exit)
             pnl_val = float(m["pnl"]) if m["pnl"] is not None else 0.0
             win_str = ("WIN" if m["is_win"] else "LOSS") if m["pnl"] is not None else ""
             broker_price = m["broker_exit"] if m["broker_exit"] else tv_price
+            old_mode = pos[1]
+            
             c.execute("INSERT INTO closed_trades (timestamp, symbol, direction, close_price, pnl, is_win, mode, slippage, qty, tv_price, broker_price, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
-                      (get_vps_time(), symbol, pos[0], broker_price, pnl_val, win_str, 'SAFE', m["slippage"], m["qty_filled"], tv_price, broker_price, m["exit_reason"]))
+                      (get_vps_time(), symbol, pos[0], broker_price, pnl_val, win_str, mode, m["slippage"], m["qty_filled"], tv_price, broker_price, m["exit_reason"]))
             c.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
-            pending_logs.append(f"🏁 [SAFE] CLOSED: {symbol} | Broker Fill: {broker_price} | PNL: ${pnl_val:.2f} {win_str} | Slip: {m['slippage']}")
+            pending_logs.append(f"🏁 [{mode}] CLOSED: {symbol} [Opened in {old_mode}] | Broker Fill: {broker_price} | PNL: ${pnl_val:.2f} {win_str} | Slip: {m['slippage']}")
+            
+            if m["pnl"] is not None:
+                PROP_GUARDS["pnl"] += pnl_val
+                PROP_GUARDS["hwm"] = max(PROP_GUARDS["hwm"], PROP_GUARDS["pnl"])
+                evaluate_prop_guards()
+
+        elif is_closing_event and not pos:
+            # Ghost closed a trade, but it wasn't tracked locally
+            pnl_val = float(m["pnl"]) if m["pnl"] is not None else 0.0
+            win_str = ("WIN" if m["is_win"] else "LOSS") if m["pnl"] is not None else ""
+            broker_price = m["broker_exit"] if m["broker_exit"] else tv_price
+            
+            c.execute("INSERT INTO closed_trades (timestamp, symbol, direction, close_price, pnl, is_win, mode, slippage, qty, tv_price, broker_price, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
+                      (get_vps_time(), symbol, 'UNKNOWN', broker_price, pnl_val, win_str, mode, m["slippage"], m["qty_filled"], tv_price, broker_price, m["exit_reason"]))
+            pending_logs.append(f"🏁 [{mode}] CLOSED UNTRACKED: {symbol} | Broker Fill: {broker_price} | PNL: ${pnl_val:.2f} {win_str} | Slip: {m['slippage']}")
+
+            if m["pnl"] is not None:
+                PROP_GUARDS["pnl"] += pnl_val
+                PROP_GUARDS["hwm"] = max(PROP_GUARDS["hwm"], PROP_GUARDS["pnl"])
+                evaluate_prop_guards()
+                
+        else:
+            # It's an entry (Long or Short)
+            broker_price = m["broker_entry"] if m["broker_entry"] else tv_price
+            c.execute("INSERT OR REPLACE INTO positions (symbol, direction, entry_price, mode, tv_price, broker_price) VALUES (?, ?, ?, ?, ?, ?)", 
+                      (symbol, action, broker_price, mode, tv_price, broker_price))
+            fill_str = f" (Filled: {m['qty_filled']})" if m['qty_filled'] > 0 else ""
+            slip_str = f" | Slip: {m['slippage']}" if m['slippage'] > 0 else ""
+            pending_logs.append(f"🟢 [{mode}] OPENED: {exec_action.upper()} {qty}x{fill_str} {symbol} | TV: {tv_price} -> Broker: {broker_price}{slip_str}")
 
         conn.commit(); conn.close()
         for log in pending_logs: log_msg(log)
@@ -314,7 +401,8 @@ if bot:
         if cmd == 'status':
             try: mode = conn.execute("SELECT value FROM system_state WHERE key='execution_mode'").fetchone()[0]
             except: mode = 'SAFE'
-            bot.reply_to(message, f"🖥️ Engine Mode: <b>{mode}</b>\n⏱️ VPS Time: {get_vps_time()}", parse_mode="HTML")
+            guard_status = f"🔴 TRIPPED ({PROP_GUARDS['reason']})" if PROP_GUARDS['tripped'] else "🟢 CLEAR"
+            bot.reply_to(message, f"🖥️ Engine Mode: <b>{mode}</b>\n🛡️ Guard: {guard_status}\n⏱️ VPS Time: {get_vps_time()}", parse_mode="HTML")
         elif cmd == 'positions':
             try: rows = conn.execute("SELECT symbol, direction, broker_price FROM positions").fetchall()
             except: rows = conn.execute("SELECT symbol, direction, entry_price FROM positions").fetchall()
@@ -334,9 +422,18 @@ if bot:
     def start_telegram_polling():
         try: bot.set_my_commands([telebot.types.BotCommand("status", "Check status"), telebot.types.BotCommand("positions", "List open trades"), telebot.types.BotCommand("closed", "Today's trades")])
         except Exception as e: pass
+        
+        # --- NEW: Silence the noisy Telegram network timeout logs ---
+        import logging
+        telebot_logger = logging.getLogger('TeleBot')
+        telebot_logger.setLevel(logging.CRITICAL)
+        
         while True:
-            try: bot.infinity_polling(timeout=20, long_polling_timeout=15)
-            except: time.sleep(10)
+            try: 
+                # Extended timeouts to prevent disconnects, and set internal logger to CRITICAL
+                bot.infinity_polling(timeout=60, long_polling_timeout=60, logger_level=logging.CRITICAL)
+            except: 
+                time.sleep(10)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -358,13 +455,15 @@ async def lifespan(app: FastAPI):
     
     eod_task = asyncio.create_task(market_close_report_loop())
     daily_task = asyncio.create_task(daily_maintenance_loop())
+    cme_task = asyncio.create_task(cme_reset_loop())
     
-    # NEW: Run Heartbeat in isolated OS Thread to guarantee zero event-loop blocking
-    threading.Thread(target=heartbeat_worker, daemon=True).start()
+    # 0ms SYNC: Run background worker in isolated OS Thread
+    threading.Thread(target=background_worker, daemon=True).start()
     
     yield
     eod_task.cancel()
     daily_task.cancel()
+    cme_task.cancel()
     await http_client.aclose()
     ngrok.kill()
 
